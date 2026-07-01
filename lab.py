@@ -603,27 +603,6 @@ status, status_color = classify_status(row, thresholds, actions)
 # ============================================================
 
 st.title("Adaptive Student Coworking Digital Twin")
-st.caption(
-    "Dataset rows are replayed as a simulated real-time sensor stream. "
-    "The digital twin reads current sensor values and calculates recommended control actions."
-)
-
-top1, top2, top3, top4 = st.columns([1.2, 1.2, 1.2, 1.2])
-
-with top1:
-    status_badge(f"Status: {status}", status_color)
-
-with top2:
-    st.metric("Mode", thresholds["label"])
-
-with top3:
-    st.metric("Scenario", str(get_value(row, "planned_scenario", "normal")))
-
-with top4:
-    ts = get_value(row, "timestamp", "unknown")
-    st.metric("Timestamp", str(ts))
-
-st.info(f"Control goal: {thresholds['goal']}")
 
 # Key metrics
 metric_cols = st.columns(7)
