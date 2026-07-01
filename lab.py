@@ -56,7 +56,6 @@ def prepare_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "co2_ppm",
         "indoor_temperature_c",
         "relative_humidity_percent",
-        "pm25_ug_m3",
         "pm10_ug_m3",
         "tvoc_ug_m3",
         "formaldehyde_ug_m3",
@@ -66,7 +65,6 @@ def prepare_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "indoor_light_lux",
         "daylight_lux",
         "outside_temperature_c",
-        "outdoor_pm25_ug_m3",
         "battery_percent",
         "energy_use_kw",
         "comfort_score",
@@ -150,8 +148,6 @@ def get_thresholds(mode: str) -> dict:
             "temp_max": 28,
             "humidity_min": 30,
             "humidity_max": 70,
-            "pm25_warn": 25,
-            "pm25_crit": 75,
             "pm10_warn": 75,
             "tvoc_warn": 700,
             "tvoc_crit": 1200,
@@ -166,7 +162,6 @@ def get_thresholds(mode: str) -> dict:
             "base_ventilation": 15,
             "high_ventilation": 55,
             "glare_lux": 1200,
-            "outdoor_pm25_high": 25,
         }
 
     return {
@@ -178,8 +173,6 @@ def get_thresholds(mode: str) -> dict:
         "temp_max": 24,
         "humidity_min": 40,
         "humidity_max": 60,
-        "pm25_warn": 15,
-        "pm25_crit": 50,
         "pm10_warn": 45,
         "tvoc_warn": 500,
         "tvoc_crit": 1000,
@@ -194,7 +187,6 @@ def get_thresholds(mode: str) -> dict:
         "base_ventilation": 25,
         "high_ventilation": 75,
         "glare_lux": 1000,
-        "outdoor_pm25_high": 25,
     }
 
 
@@ -215,7 +207,6 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
     co2 = float(get_value(row, "co2_ppm", 420))
     temp = float(get_value(row, "indoor_temperature_c", 22))
     humidity = float(get_value(row, "relative_humidity_percent", 45))
-    pm25 = float(get_value(row, "pm25_ug_m3", 5))
     pm10 = float(get_value(row, "pm10_ug_m3", 10))
     tvoc = float(get_value(row, "tvoc_ug_m3", 250))
     hcho = float(get_value(row, "formaldehyde_ug_m3", 10))
@@ -224,7 +215,6 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
     noise = float(get_value(row, "noise_dba", 40))
     daylight = float(get_value(row, "daylight_lux", 300))
     outside_temp = float(get_value(row, "outside_temperature_c", temp))
-    outdoor_pm25 = float(get_value(row, "outdoor_pm25_ug_m3", 5))
     battery = float(get_value(row, "battery_percent", 100))
 
     smoke = int(get_value(row, "smoke_detected", 0)) == 1
@@ -238,8 +228,6 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
     heating = 0
     cooling = 0
     lighting = 0
-    blinds = 20
-    sound_masking = 0
     emergency_lights = 0
     smoke_exhaust = 0
 
@@ -262,13 +250,9 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
         system_notes.append("Space is overcrowded → occupancy warning activated.")
 
     # Air pollution
-    if pm25 > thresholds["pm25_warn"] or pm10 > thresholds["pm10_warn"]:
+    if pm10 > thresholds["pm10_warn"]:
         filtration = max(filtration, 80)
-        system_notes.append("Particulate matter is high → filtration increased.")
-
-    if pm25 > thresholds["pm25_crit"]:
-        filtration = 100
-        system_notes.append("PM2.5 is critical → maximum filtration required.")
+        system_notes.append("PM10 is high → filtration increased.")
 
     if tvoc > thresholds["tvoc_warn"] or hcho > thresholds["hcho_warn"]:
         ventilation = max(ventilation, 70)
@@ -280,13 +264,8 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
         filtration = 100
         system_notes.append("CO/O₂ safety risk → maximum air exchange required.")
 
-    # Outdoor pollution logic
-    if outdoor_pm25 > thresholds["outdoor_pm25_high"] and co2 < thresholds["co2_crit"]:
-        outside_air_intake = min(ventilation, 30)
-        filtration = 100
-        system_notes.append("Outdoor PM2.5 is high → outside air intake limited, filtration increased.")
-    else:
-        outside_air_intake = ventilation
+    # Outside air follows the requested ventilation level
+    outside_air_intake = ventilation
 
     # Temperature
     if temp < thresholds["temp_min"]:
@@ -318,19 +297,9 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
     artificial_needed = max(0, target_lux - daylight)
     lighting = min(100, artificial_needed / 650 * 100)
 
-    # Blinds
-    if daylight > thresholds["glare_lux"]:
-        blinds = 80
-        system_notes.append("Too much daylight/glare → blinds closed.")
-
-    if temp > thresholds["temp_max"] and outside_temp > temp:
-        blinds = 90
-        system_notes.append("Outdoor heat is high → blinds closed to reduce solar gains.")
-
     # Noise
     if mode == "coworking" and noise > thresholds["noise_warn"]:
-        sound_masking = 40
-        system_notes.append("Noise is high → quiet-zone alert / sound masking activated.")
+        system_notes.append("Noise is high → quiet-zone alert activated.")
 
     # Energy saving
     energy_saving = False
@@ -339,21 +308,17 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
 
     if energy_saving:
         lighting *= 0.7
-        sound_masking *= 0.5
         system_notes.append("Energy-saving logic is active.")
 
     # Safety
     alarm_state = "OFF"
     exits_state = "Normal access"
-    outlets_state = "ON"
-    maintenance_alert = "OFF"
 
     if mode == "emergency_shelter":
         exits_state = "Emergency exits unlocked"
 
     if ventilation_fault:
-        maintenance_alert = "Ventilation fault"
-        system_notes.append("Ventilation fault detected → maintenance alert.")
+        system_notes.append("Ventilation fault detected.")
 
     if smoke:
         alarm_state = "FIRE ALARM"
@@ -366,8 +331,7 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
         system_notes.append("Smoke detected → fire safety scenario activated.")
 
     if water_leak:
-        outlets_state = "OFF in affected zone"
-        system_notes.append("Water leak detected → affected outlets switched off.")
+        system_notes.append("Water leak detected.")
 
     return {
         "occupancy_ratio": occupancy_ratio,
@@ -378,15 +342,11 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
         "heating": float(np.clip(heating, 0, 100)),
         "cooling": float(np.clip(cooling, 0, 100)),
         "lighting": float(np.clip(lighting, 0, 100)),
-        "blinds": float(np.clip(blinds, 0, 100)),
-        "sound_masking": float(np.clip(sound_masking, 0, 100)),
         "emergency_lights": float(np.clip(emergency_lights, 0, 100)),
         "smoke_exhaust": float(np.clip(smoke_exhaust, 0, 100)),
         "energy_saving": energy_saving,
         "alarm_state": alarm_state,
         "exits_state": exits_state,
-        "outlets_state": outlets_state,
-        "maintenance_alert": maintenance_alert,
         "notes": system_notes if system_notes else ["All indicators are within the target range."]
     }
 
@@ -395,7 +355,6 @@ def classify_status(row: pd.Series, thresholds: dict, actions: dict):
     co2 = float(get_value(row, "co2_ppm", 420))
     temp = float(get_value(row, "indoor_temperature_c", 22))
     humidity = float(get_value(row, "relative_humidity_percent", 45))
-    pm25 = float(get_value(row, "pm25_ug_m3", 5))
     tvoc = float(get_value(row, "tvoc_ug_m3", 250))
     co = float(get_value(row, "co_ppm", 0))
     oxygen = float(get_value(row, "oxygen_percent", 20.9))
@@ -408,7 +367,6 @@ def classify_status(row: pd.Series, thresholds: dict, actions: dict):
     critical = (
         smoke
         or co2 > thresholds["co2_crit"]
-        or pm25 > thresholds["pm25_crit"]
         or tvoc > thresholds["tvoc_crit"]
         or co > thresholds["co_crit"]
         or oxygen < thresholds["oxygen_min"]
@@ -421,7 +379,6 @@ def classify_status(row: pd.Series, thresholds: dict, actions: dict):
         or temp > thresholds["temp_max"]
         or humidity < thresholds["humidity_min"]
         or humidity > thresholds["humidity_max"]
-        or pm25 > thresholds["pm25_warn"]
         or tvoc > thresholds["tvoc_warn"]
         or noise > thresholds["noise_warn"]
         or water_leak
@@ -483,15 +440,6 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
         opacity=0.45,
     )
 
-    # Zoning blocks
-    fig.add_shape(type="rect", x0=0.5, y0=0.5, x1=4, y1=3, line=dict(color="#555"), fillcolor="rgba(255,255,255,0.35)")
-    fig.add_shape(type="rect", x0=4.5, y0=0.5, x1=8, y1=3, line=dict(color="#555"), fillcolor="rgba(255,255,255,0.35)")
-    fig.add_shape(type="rect", x0=8.5, y0=0.5, x1=11.5, y1=3, line=dict(color="#555"), fillcolor="rgba(255,255,255,0.35)")
-
-    fig.add_annotation(x=2.25, y=1.75, text="Focus zone", showarrow=False, font=dict(size=11))
-    fig.add_annotation(x=6.25, y=1.75, text="Group zone", showarrow=False, font=dict(size=11))
-    fig.add_annotation(x=10, y=1.75, text="Shelter zone", showarrow=False, font=dict(size=11))
-
     # People dots
     dots = min(occupancy, 220)
     if dots > 0:
@@ -523,7 +471,7 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
     )
     fig.add_annotation(x=12.7, y=4.45, text="Vent", showarrow=False, font=dict(size=12))
 
-    # Door
+    # Main door
     door_open = int(get_value(row, "door_open", 0))
     door_color = "#4CAF50" if door_open else "#795548"
     fig.add_shape(
@@ -535,7 +483,26 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
         line=dict(color=door_color, width=3),
         fillcolor=door_color,
     )
-    fig.add_annotation(x=6, y=-0.35, text="Door open" if door_open else "Door closed", showarrow=False, font=dict(size=11))
+    fig.add_annotation(x=6, y=-0.35, text="Main door", showarrow=False, font=dict(size=11))
+
+    # Emergency exit
+    fig.add_shape(
+        type="rect",
+        x0=-0.1,
+        y0=4.8,
+        x1=0.15,
+        y1=6.2,
+        line=dict(color="#D32F2F", width=3),
+        fillcolor="#D32F2F",
+    )
+    fig.add_annotation(
+        x=-0.45,
+        y=5.5,
+        text="Emergency exit",
+        textangle=-90,
+        showarrow=False,
+        font=dict(size=11, color="#D32F2F"),
+    )
 
     title = f"{mode} | {scenario} | {status} | Ventilation {actions['ventilation']:.0f}% | Filtration {actions['filtration']:.0f}%"
 
@@ -659,7 +626,7 @@ with top4:
 st.info(f"Control goal: {thresholds['goal']}")
 
 # Key metrics
-metric_cols = st.columns(8)
+metric_cols = st.columns(7)
 
 with metric_cols[0]:
     st.metric("People", int(get_value(row, "occupancy", 0)))
@@ -677,12 +644,9 @@ with metric_cols[4]:
     st.metric("Humidity", f"{get_value(row, 'relative_humidity_percent', 0):.0f}%")
 
 with metric_cols[5]:
-    st.metric("PM2.5", f"{get_value(row, 'pm25_ug_m3', 0):.1f} μg/m³")
-
-with metric_cols[6]:
     st.metric("Battery", f"{get_value(row, 'battery_percent', 0):.0f}%")
 
-with metric_cols[7]:
+with metric_cols[6]:
     st.metric("Comfort", f"{get_value(row, 'comfort_score', 0):.0f}/100")
 
 
@@ -701,13 +665,11 @@ with right:
     st.subheader("Digital twin recommended actions")
 
     pct_bar("Ventilation", actions["ventilation"], "Controls CO₂, humidity and heat removal.")
-    pct_bar("Outside air intake", actions["outside_air_intake"], "Limited if outdoor PM2.5 is high.")
-    pct_bar("Air filtration", actions["filtration"], "Controls PM2.5, PM10, VOC and formaldehyde.")
+    pct_bar("Outside air intake", actions["outside_air_intake"], "Follows the requested ventilation level.")
+    pct_bar("Air filtration", actions["filtration"], "Controls PM10, VOC and formaldehyde.")
     pct_bar("Heating", actions["heating"])
     pct_bar("Cooling", actions["cooling"])
     pct_bar("Lighting", actions["lighting"])
-    pct_bar("Blinds closed", actions["blinds"])
-    pct_bar("Sound masking", actions["sound_masking"])
 
     if actions["emergency_lights"] > 0:
         pct_bar("Emergency lights", actions["emergency_lights"])
@@ -718,8 +680,6 @@ with right:
     st.write(f"**Energy saving:** {'ON' if actions['energy_saving'] else 'OFF'}")
     st.write(f"**Alarm:** {actions['alarm_state']}")
     st.write(f"**Exits:** {actions['exits_state']}")
-    st.write(f"**Power outlets:** {actions['outlets_state']}")
-    st.write(f"**Maintenance:** {actions['maintenance_alert']}")
 
 
 # ============================================================
@@ -737,7 +697,6 @@ with tab_sensors:
                 "CO₂",
                 "Temperature",
                 "Relative humidity",
-                "PM2.5",
                 "PM10",
                 "TVOC",
                 "Formaldehyde",
@@ -747,7 +706,6 @@ with tab_sensors:
                 "Indoor light",
                 "Daylight",
                 "Outdoor temperature",
-                "Outdoor PM2.5",
                 "Area per person",
                 "Battery",
                 "Energy use",
@@ -756,7 +714,6 @@ with tab_sensors:
                 f"{get_value(row, 'co2_ppm', 0):.0f} ppm",
                 f"{get_value(row, 'indoor_temperature_c', 0):.1f} °C",
                 f"{get_value(row, 'relative_humidity_percent', 0):.0f}%",
-                f"{get_value(row, 'pm25_ug_m3', 0):.1f} μg/m³",
                 f"{get_value(row, 'pm10_ug_m3', 0):.1f} μg/m³",
                 f"{get_value(row, 'tvoc_ug_m3', 0):.0f} μg/m³",
                 f"{get_value(row, 'formaldehyde_ug_m3', 0):.1f} μg/m³",
@@ -766,7 +723,6 @@ with tab_sensors:
                 f"{get_value(row, 'indoor_light_lux', 0):.0f} lux",
                 f"{get_value(row, 'daylight_lux', 0):.0f} lux",
                 f"{get_value(row, 'outside_temperature_c', 0):.1f} °C",
-                f"{get_value(row, 'outdoor_pm25_ug_m3', 0):.1f} μg/m³",
                 "empty" if np.isinf(actions["area_per_person"]) else f"{actions['area_per_person']:.1f} m²/person",
                 f"{get_value(row, 'battery_percent', 0):.0f}%",
                 f"{get_value(row, 'energy_use_kw', 0):.2f} kW",
@@ -775,7 +731,6 @@ with tab_sensors:
                 f"< {thresholds['co2_warn']} ppm; critical > {thresholds['co2_crit']} ppm",
                 f"{thresholds['temp_min']}–{thresholds['temp_max']} °C",
                 f"{thresholds['humidity_min']}–{thresholds['humidity_max']}%",
-                f"< {thresholds['pm25_warn']} μg/m³",
                 f"< {thresholds['pm10_warn']} μg/m³",
                 f"< {thresholds['tvoc_warn']} μg/m³",
                 f"< {thresholds['hcho_warn']} μg/m³",
@@ -785,7 +740,6 @@ with tab_sensors:
                 f"≈ {thresholds['lux_target']} lux",
                 "Used for daylight harvesting",
                 "Used for heating/cooling decision",
-                f"< {thresholds['outdoor_pm25_high']} μg/m³ preferred for outside intake",
                 "Coworking: 4–6 m²/person; shelter can be denser",
                 f"Warning < {thresholds['battery_warn']}%",
                 "Minimize without harming comfort/health",
@@ -816,7 +770,6 @@ with tab_compare:
         ("Heating", "heating_level_percent", actions["heating"]),
         ("Cooling", "cooling_level_percent", actions["cooling"]),
         ("Lighting", "lighting_level_percent", actions["lighting"]),
-        ("Blinds closed", "blinds_closed_percent", actions["blinds"]),
     ]
 
     comparison = []
@@ -881,7 +834,6 @@ with tab_air:
     fig = go.Figure()
 
     for col, name in [
-        ("pm25_ug_m3", "PM2.5"),
         ("pm10_ug_m3", "PM10"),
         ("tvoc_ug_m3", "TVOC"),
         ("formaldehyde_ug_m3", "Formaldehyde"),
@@ -939,3 +891,4 @@ if playback_mode == "Auto":
     time.sleep(speed)
     st.session_state.row_index = (st.session_state.row_index + 1) % len(filtered)
     st.rerun()
+
