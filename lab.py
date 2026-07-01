@@ -7,6 +7,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, mean_absolute_error
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
 
 # ============================================================
 # PAGE CONFIG
@@ -190,6 +198,190 @@ def get_thresholds(mode: str) -> dict:
     }
 
 
+
+# ============================================================
+# AI / ML PREDICTION MODULE
+# ============================================================
+
+NUMERIC_FEATURES = [
+    "occupancy",
+    "active_capacity",
+    "floor_area_m2",
+    "co2_ppm",
+    "indoor_temperature_c",
+    "relative_humidity_percent",
+    "pm10_ug_m3",
+    "tvoc_ug_m3",
+    "formaldehyde_ug_m3",
+    "co_ppm",
+    "oxygen_percent",
+    "noise_dba",
+    "indoor_light_lux",
+    "daylight_lux",
+    "outside_temperature_c",
+    "battery_percent",
+    "energy_use_kw",
+    "ventilation_level_percent",
+    "outside_air_intake_percent",
+    "filtration_level_percent",
+    "heating_level_percent",
+    "cooling_level_percent",
+    "lighting_level_percent",
+    "estimated_air_changes_per_hour",
+    "estimated_airflow_lps",
+]
+
+CATEGORICAL_FEATURES = [
+    "mode",
+    "planned_scenario",
+    "power_state",
+    "ventilation_state",
+]
+
+REGRESSION_TARGETS = [
+    "future_co2_ppm",
+    "future_temperature_c",
+    "future_comfort_score",
+]
+
+
+def get_existing_features(df: pd.DataFrame):
+    numeric = [col for col in NUMERIC_FEATURES if col in df.columns]
+    categorical = [col for col in CATEGORICAL_FEATURES if col in df.columns]
+    return numeric, categorical
+
+
+@st.cache_resource
+def train_ai_models(df: pd.DataFrame, horizon_steps: int = 2):
+    """
+    Trains small ML models on the loaded sensor dataset.
+
+    horizon_steps=2 means approximately 10 minutes ahead
+    if the dataset interval is 5 minutes.
+    """
+    data = df.copy()
+
+    required_targets = ["co2_ppm", "indoor_temperature_c", "comfort_score", "is_unsafe"]
+    missing = [col for col in required_targets if col not in data.columns]
+    if missing:
+        return None, {"error": f"Missing columns for AI model: {missing}"}
+
+    data["future_co2_ppm"] = data["co2_ppm"].shift(-horizon_steps)
+    data["future_temperature_c"] = data["indoor_temperature_c"].shift(-horizon_steps)
+    data["future_comfort_score"] = data["comfort_score"].shift(-horizon_steps)
+    data["future_is_unsafe"] = data["is_unsafe"].shift(-horizon_steps)
+
+    data = data.dropna(subset=REGRESSION_TARGETS + ["future_is_unsafe"]).reset_index(drop=True)
+
+    if len(data) < 100:
+        return None, {"error": "Not enough rows to train the AI model."}
+
+    numeric_features, categorical_features = get_existing_features(data)
+
+    X = data[numeric_features + categorical_features]
+    y_reg = data[REGRESSION_TARGETS]
+    y_cls = data["future_is_unsafe"].astype(int)
+
+    X_train, X_test, y_reg_train, y_reg_test, y_cls_train, y_cls_test = train_test_split(
+        X,
+        y_reg,
+        y_cls,
+        test_size=0.2,
+        shuffle=False,
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", SimpleImputer(strategy="median"), numeric_features),
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                    ]
+                ),
+                categorical_features,
+            ),
+        ],
+        remainder="drop",
+    )
+
+    regressor = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            (
+                "model",
+                RandomForestRegressor(
+                    n_estimators=80,
+                    max_depth=12,
+                    random_state=42,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    classifier = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            (
+                "model",
+                RandomForestClassifier(
+                    n_estimators=80,
+                    max_depth=12,
+                    random_state=42,
+                    n_jobs=-1,
+                    class_weight="balanced",
+                ),
+            ),
+        ]
+    )
+
+    regressor.fit(X_train, y_reg_train)
+    classifier.fit(X_train, y_cls_train)
+
+    reg_pred = regressor.predict(X_test)
+    cls_pred = classifier.predict(X_test)
+
+    metrics = {
+        "co2_mae": float(mean_absolute_error(y_reg_test["future_co2_ppm"], reg_pred[:, 0])),
+        "temperature_mae": float(mean_absolute_error(y_reg_test["future_temperature_c"], reg_pred[:, 1])),
+        "comfort_mae": float(mean_absolute_error(y_reg_test["future_comfort_score"], reg_pred[:, 2])),
+        "unsafe_accuracy": float(accuracy_score(y_cls_test, cls_pred)),
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+    }
+
+    return {"regressor": regressor, "classifier": classifier}, metrics
+
+
+def predict_future_state(row: pd.Series, models: dict, numeric_features: list, categorical_features: list) -> dict:
+    if models is None:
+        return {}
+
+    X_current = pd.DataFrame([
+        {col: get_value(row, col, np.nan) for col in numeric_features + categorical_features}
+    ])
+
+    reg_prediction = models["regressor"].predict(X_current)[0]
+    unsafe_prediction = int(models["classifier"].predict(X_current)[0])
+
+    if hasattr(models["classifier"], "predict_proba"):
+        proba = models["classifier"].predict_proba(X_current)[0]
+        unsafe_probability = float(proba[1]) if len(proba) > 1 else float(unsafe_prediction)
+    else:
+        unsafe_probability = float(unsafe_prediction)
+
+    return {
+        "future_co2_ppm": float(reg_prediction[0]),
+        "future_temperature_c": float(reg_prediction[1]),
+        "future_comfort_score": float(reg_prediction[2]),
+        "future_is_unsafe": unsafe_prediction,
+        "unsafe_probability": unsafe_probability,
+    }
+
+
 # ============================================================
 # DIGITAL TWIN DECISION LOGIC
 # ============================================================
@@ -350,6 +542,58 @@ def decide_actions(row: pd.Series, thresholds: dict) -> dict:
         "notes": system_notes if system_notes else ["All indicators are within the target range."]
     }
 
+
+
+def apply_ai_assistance(actions: dict, ai_prediction: dict, thresholds: dict) -> dict:
+    """
+    Adds proactive control: if AI predicts that conditions will get worse,
+    the system acts before the threshold is crossed.
+    """
+    actions = actions.copy()
+    notes = list(actions.get("notes", []))
+
+    if not ai_prediction:
+        actions["notes"] = notes
+        return actions
+
+    predicted_co2 = ai_prediction["future_co2_ppm"]
+    predicted_temp = ai_prediction["future_temperature_c"]
+    predicted_comfort = ai_prediction["future_comfort_score"]
+    unsafe_probability = ai_prediction["unsafe_probability"]
+
+    if predicted_co2 > thresholds["co2_warn"] and actions["ventilation"] < thresholds["high_ventilation"]:
+        actions["ventilation"] = thresholds["high_ventilation"]
+        actions["outside_air_intake"] = thresholds["high_ventilation"]
+        notes.append("AI predicts CO₂ may exceed the warning threshold → ventilation increased proactively.")
+
+    if predicted_co2 > thresholds["co2_crit"]:
+        actions["ventilation"] = 100
+        actions["outside_air_intake"] = 100
+        notes.append("AI predicts critical CO₂ → maximum ventilation selected.")
+
+    if predicted_temp > thresholds["temp_max"] and actions["cooling"] < 45:
+        actions["cooling"] = 45
+        actions["ventilation"] = max(actions["ventilation"], 45)
+        notes.append("AI predicts overheating → cooling activated proactively.")
+
+    if predicted_temp < thresholds["temp_min"] and actions["heating"] < 45:
+        actions["heating"] = 45
+        notes.append("AI predicts low temperature → heating activated proactively.")
+
+    if unsafe_probability >= 0.6:
+        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
+        actions["filtration"] = max(actions["filtration"], 80)
+        notes.append("AI predicts increased unsafe-state risk → preventive ventilation and filtration applied.")
+
+    if predicted_comfort < 60:
+        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
+        notes.append("AI predicts low comfort score → preventive control action applied.")
+
+    for key in ["ventilation", "outside_air_intake", "filtration", "heating", "cooling", "lighting"]:
+        actions[key] = float(np.clip(actions[key], 0, 100))
+
+    actions["notes"] = notes
+    return actions
 
 def classify_status(row: pd.Series, thresholds: dict, actions: dict):
     co2 = float(get_value(row, "co2_ppm", 420))
@@ -541,6 +785,15 @@ else:
     )
     st.stop()
 
+horizon_steps = st.sidebar.selectbox(
+    "AI prediction horizon",
+    options=[1, 2, 3, 6],
+    index=1,
+    format_func=lambda x: f"{x * 5} minutes ahead",
+)
+
+ai_models, ai_metrics = train_ai_models(dataset, horizon_steps=horizon_steps)
+
 # Filters
 available_modes = sorted(dataset["mode"].dropna().unique().tolist())
 selected_modes = st.sidebar.multiselect(
@@ -594,7 +847,19 @@ if st.sidebar.button("Restart playback"):
 row = filtered.iloc[st.session_state.row_index]
 mode = str(get_value(row, "mode", "coworking"))
 thresholds = get_thresholds(mode)
-actions = decide_actions(row, thresholds)
+
+if ai_models is not None:
+    ai_prediction = predict_future_state(
+        row,
+        ai_models,
+        ai_metrics["numeric_features"],
+        ai_metrics["categorical_features"],
+    )
+else:
+    ai_prediction = {}
+
+rule_actions = decide_actions(row, thresholds)
+actions = apply_ai_assistance(rule_actions, ai_prediction, thresholds)
 status, status_color = classify_status(row, thresholds, actions)
 
 
@@ -605,27 +870,30 @@ status, status_color = classify_status(row, thresholds, actions)
 st.title("Adaptive Student Coworking Digital Twin")
 
 # Key metrics
-metric_cols = st.columns(7)
+metric_cols = st.columns(8)
 
 with metric_cols[0]:
-    st.metric("People", int(get_value(row, "occupancy", 0)))
+    st.metric("Current situation", str(get_value(row, "planned_scenario", "normal")))
 
 with metric_cols[1]:
-    st.metric("Capacity use", f"{actions['occupancy_ratio'] * 100:.0f}%")
+    st.metric("People", int(get_value(row, "occupancy", 0)))
 
 with metric_cols[2]:
-    st.metric("CO₂", f"{get_value(row, 'co2_ppm', 0):.0f} ppm")
+    st.metric("Capacity use", f"{actions['occupancy_ratio'] * 100:.0f}%")
 
 with metric_cols[3]:
-    st.metric("Temperature", f"{get_value(row, 'indoor_temperature_c', 0):.1f} °C")
+    st.metric("CO₂", f"{get_value(row, 'co2_ppm', 0):.0f} ppm")
 
 with metric_cols[4]:
-    st.metric("Humidity", f"{get_value(row, 'relative_humidity_percent', 0):.0f}%")
+    st.metric("Temperature", f"{get_value(row, 'indoor_temperature_c', 0):.1f} °C")
 
 with metric_cols[5]:
-    st.metric("Battery", f"{get_value(row, 'battery_percent', 0):.0f}%")
+    st.metric("Humidity", f"{get_value(row, 'relative_humidity_percent', 0):.0f}%")
 
 with metric_cols[6]:
+    st.metric("Battery", f"{get_value(row, 'battery_percent', 0):.0f}%")
+
+with metric_cols[7]:
     st.metric("Comfort", f"{get_value(row, 'comfort_score', 0):.0f}/100")
 
 
@@ -633,15 +901,49 @@ with metric_cols[6]:
 # ROOM + ACTIONS
 # ============================================================
 
-left, right = st.columns([1.25, 1])
+left, middle, right = st.columns([1.15, 0.85, 1])
 
 with left:
     st.subheader("Room state")
     fig_room = make_room_figure(row, actions, status, status_color)
     st.plotly_chart(fig_room, use_container_width=True)
 
+with middle:
+    st.subheader("AI prediction")
+
+    if ai_models is None:
+        st.warning(ai_metrics.get("error", "AI model could not be trained."))
+    else:
+        st.metric(
+            f"CO₂ in {horizon_steps * 5} min",
+            f"{ai_prediction['future_co2_ppm']:.0f} ppm",
+            delta=f"{ai_prediction['future_co2_ppm'] - float(get_value(row, 'co2_ppm', 0)):.0f} ppm",
+        )
+        st.metric(
+            f"Temperature in {horizon_steps * 5} min",
+            f"{ai_prediction['future_temperature_c']:.1f} °C",
+            delta=f"{ai_prediction['future_temperature_c'] - float(get_value(row, 'indoor_temperature_c', 0)):.1f} °C",
+        )
+        st.metric(
+            f"Comfort in {horizon_steps * 5} min",
+            f"{ai_prediction['future_comfort_score']:.0f}/100",
+            delta=f"{ai_prediction['future_comfort_score'] - float(get_value(row, 'comfort_score', 0)):.0f}",
+        )
+        st.metric("Unsafe risk", f"{ai_prediction['unsafe_probability'] * 100:.0f}%")
+
+        with st.expander("AI model quality"):
+            st.write(f"CO₂ MAE: **{ai_metrics['co2_mae']:.1f} ppm**")
+            st.write(f"Temperature MAE: **{ai_metrics['temperature_mae']:.2f} °C**")
+            st.write(f"Comfort score MAE: **{ai_metrics['comfort_mae']:.1f} points**")
+            st.write(f"Unsafe-state accuracy: **{ai_metrics['unsafe_accuracy'] * 100:.1f}%**")
+            st.caption(
+                "The model is trained on the currently loaded synthetic/historical sensor dataset. "
+                "It predicts the future state and helps the controller act proactively."
+            )
+
+
 with right:
-    st.subheader("Digital twin recommended actions")
+    st.subheader("Recommended actions")
 
     pct_bar("Ventilation", actions["ventilation"], "Controls CO₂, humidity and heat removal.")
     pct_bar("Outside air intake", actions["outside_air_intake"], "Follows the requested ventilation level.")
@@ -766,7 +1068,7 @@ with tab_compare:
 
     st.caption(
         "Dataset equipment state can be interpreted as the recorded/current state of equipment. "
-        "Digital twin recommendation is calculated live from sensor values."
+        "Digital twin recommendation is calculated live from sensor values and AI forecast."
     )
 
 
@@ -870,4 +1172,3 @@ if playback_mode == "Auto":
     time.sleep(speed)
     st.session_state.row_index = (st.session_state.row_index + 1) % len(filtered)
     st.rerun()
-
