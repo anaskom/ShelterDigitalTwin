@@ -29,6 +29,7 @@ DEFAULT_DATA_PATHS = [
 
 HORIZON_STEPS = 2          # 2 steps * 5 min = 10 min forecast
 STEP_MINUTES = 5
+FIXED_UPDATE_INTERVAL = 0.3
 
 
 # ============================================================
@@ -729,7 +730,9 @@ def forecast_state(state, inputs, actions, steps):
 def reset_simulation(simulation_mode):
     st.session_state.state = initial_state(simulation_mode)
     st.session_state.history = []
+    st.session_state.state_stack = []
     st.session_state.last_simulation_mode = simulation_mode
+    st.session_state.is_running = True
 
 
 # ============================================================
@@ -744,19 +747,40 @@ simulation_mode = st.sidebar.radio(
     index=2,
 )
 
-speed = st.sidebar.slider("State update speed, seconds", 0.5, 3.0, 1.0)
-auto_run = st.sidebar.toggle("Run simulation", value=True)
-st.sidebar.caption("Only the simulation frame updates automatically, so charts should flicker less.")
-
 if "state" not in st.session_state or st.session_state.get("last_simulation_mode") != simulation_mode:
     reset_simulation(simulation_mode)
 
-if st.sidebar.button("Restart simulation"):
+if "is_running" not in st.session_state:
+    st.session_state.is_running = True
+
+st.sidebar.caption(f"State changes automatically every {FIXED_UPDATE_INTERVAL:.1f} seconds.")
+
+if st.session_state.is_running:
+    if st.sidebar.button("Stop simulation", width="stretch"):
+        st.session_state.is_running = False
+        st.rerun()
+else:
+    if st.sidebar.button("Start simulation", width="stretch"):
+        st.session_state.is_running = True
+        st.rerun()
+
+step_cols = st.sidebar.columns(2)
+
+with step_cols[0]:
+    if st.button("Step back", width="stretch"):
+        st.session_state.manual_previous = True
+        st.session_state.is_running = False
+
+with step_cols[1]:
+    if st.button("Next step", width="stretch"):
+        st.session_state.manual_next = True
+        st.session_state.is_running = False
+
+if st.sidebar.button("Restart simulation", width="stretch"):
     reset_simulation(simulation_mode)
     st.rerun()
 
-if st.sidebar.button("Next state"):
-    st.session_state.manual_next = True
+st.sidebar.caption("Step back returns to the previous simulated state. Next step advances the model once without autoplay.")
 
 
 
@@ -815,16 +839,25 @@ def calculate_loop_outputs(current_state, simulation_mode):
     }
 
 
+if st.session_state.pop("manual_previous", False):
+    if st.session_state.get("state_stack"):
+        st.session_state.state = st.session_state.state_stack.pop()
+        if st.session_state.get("history"):
+            st.session_state.history = st.session_state.history[:-1]
+    st.rerun()
+
 if st.session_state.pop("manual_next", False):
     manual_outputs = calculate_loop_outputs(st.session_state.state, simulation_mode)
+    st.session_state.state_stack.append(st.session_state.state.copy())
     st.session_state.state = manual_outputs["next_state"]
+    st.rerun()
 
 
 # ============================================================
 # FRAGMENTED UI
 # ============================================================
 
-run_every_value = f"{speed}s" if auto_run else None
+run_every_value = f"{FIXED_UPDATE_INTERVAL}s" if st.session_state.is_running else None
 
 if hasattr(st, "fragment"):
     def simulation_fragment(func):
@@ -869,7 +902,7 @@ def render_simulation_frame():
             <div style="font-size: 1.6rem; font-weight: 800;">{state['situation']}</div>
             <div style="font-size: 1rem; opacity: 0.85;">
                 Space mode: <b>{mode_label}</b> · Step: <b>{step}</b> · 
-                The loop is: sensors → forecast → control action → changed room state → next sensor state.
+                The loop updates every 0.3s: sensors → forecast → control action → changed room state → next sensor state.
             </div>
         </div>
         """,
@@ -1182,7 +1215,10 @@ def render_simulation_frame():
 
 
 
-    if auto_run:
+    if st.session_state.is_running:
+        st.session_state.state_stack.append(state.copy())
+        if len(st.session_state.state_stack) > 500:
+            st.session_state.state_stack = st.session_state.state_stack[-500:]
         st.session_state.state = next_state
 
 
