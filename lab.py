@@ -630,7 +630,6 @@ simulation_mode = st.sidebar.radio(
 
 speed = st.sidebar.slider("State update speed, seconds", 0.5, 3.0, 1.0)
 auto_run = st.sidebar.toggle("Run simulation", value=True)
-st.sidebar.caption("Only the simulation frame updates automatically, so charts should flicker less.")
 
 if "state" not in st.session_state or st.session_state.get("last_simulation_mode") != simulation_mode:
     reset_simulation(simulation_mode)
