@@ -299,6 +299,8 @@ def scenario_inputs(simulation_mode, step):
         "event_tvoc": 0,
         "event_heat": 0,
         "event_noise": 0,
+        "recovery_boost": False,
+        "cycle_reset": False,
     }
 
     if simulation_mode == "Coworking only":
@@ -358,55 +360,78 @@ def scenario_inputs(simulation_mode, step):
             base["backup_power_only"] = False
 
     else:
-        # Full transition: coworking -> emergency -> shelter stabilization
-        if phase < 75:
+        # Full transition demo loop:
+        # 1) green coworking;
+        # 2) more people arrive and the room gets worse;
+        # 3) the control system stabilizes it back to green;
+        # 4) emergency mode starts and the same logic repeats in shelter mode.
+        phase = step % 180
+
+        if phase < 25:
             base["space_mode"] = "coworking"
             base["situation"] = "normal coworking"
-            base["occupancy"] = int(10 + phase * 0.4)
-        elif phase < 125:
+            base["active_capacity"] = 60
+            base["occupancy"] = int(14 + phase * 0.12)
+            base["outside_humidity_percent"] = 45
+            base["cycle_reset"] = phase < 3
+
+        elif phase < 55:
             base["space_mode"] = "coworking"
-            base["situation"] = "crowded coworking"
-            base["occupancy"] = 48
+            base["situation"] = "people arrive in coworking"
+            base["active_capacity"] = 60
+            base["occupancy"] = int(28 + (phase - 25) * 0.65)
+            base["event_noise"] = 6
+            base["event_tvoc"] = 8
+            base["outside_humidity_percent"] = 48
+
+        elif phase < 80:
+            base["space_mode"] = "coworking"
+            base["situation"] = "coworking stabilized after control"
+            base["active_capacity"] = 60
+            base["occupancy"] = 24
+            base["outside_humidity_percent"] = 45
+            base["recovery_boost"] = True
+
+        elif phase < 95:
+            base["space_mode"] = "shelter"
+            base["situation"] = "emergency mode activated"
+            base["active_capacity"] = 220
+            base["occupancy"] = int(70 + (phase - 80) * 2.0)
+            base["daylight_lux"] = min(base["daylight_lux"], 110)
+            base["outside_humidity_percent"] = 50
             base["event_noise"] = 8
-        elif phase < 165:
-            base["space_mode"] = "coworking"
-            base["situation"] = "overheating before emergency"
-            base["occupancy"] = 45
-            base["outside_temperature_c"] = 29
-            base["event_heat"] = 0.10
-        elif phase < 205:
+
+        elif phase < 115:
             base["space_mode"] = "shelter"
-            base["situation"] = "emergency transition"
+            base["situation"] = "stable shelter mode"
             base["active_capacity"] = 220
-            base["occupancy"] = int(80 + (phase - 165) * 2.2)
-            base["daylight_lux"] = min(base["daylight_lux"], 100)
-            base["event_noise"] = 15
-        elif phase < 265:
+            base["occupancy"] = 105
+            base["daylight_lux"] = 90
+            base["outside_humidity_percent"] = 50
+            base["recovery_boost"] = True
+
+        elif phase < 145:
             base["space_mode"] = "shelter"
-            base["situation"] = "power outage in shelter"
+            base["situation"] = "shelter conditions worsen"
             base["active_capacity"] = 220
-            base["occupancy"] = 170
+            base["occupancy"] = 165
             base["grid_available"] = False
             base["backup_power_only"] = True
-            base["daylight_lux"] = 60
+            base["daylight_lux"] = 45
+            base["outside_humidity_percent"] = 58
             base["event_noise"] = 12
-        elif phase < 315:
-            base["space_mode"] = "shelter"
-            base["situation"] = "ventilation fault in shelter"
-            base["active_capacity"] = 220
-            base["occupancy"] = 150
-            base["grid_available"] = False
-            base["backup_power_only"] = True
-            base["ventilation_fault"] = True
-            base["daylight_lux"] = 40
+            base["event_tvoc"] = 18
+
         else:
             base["space_mode"] = "shelter"
-            base["situation"] = "shelter stabilization"
+            base["situation"] = "shelter stabilized after control"
             base["active_capacity"] = 220
-            base["occupancy"] = 115
+            base["occupancy"] = 95
             base["grid_available"] = True
             base["backup_power_only"] = False
-            base["daylight_lux"] = 80
+            base["daylight_lux"] = 85
+            base["outside_humidity_percent"] = 48
+            base["recovery_boost"] = True
 
     return base
 
@@ -609,8 +634,23 @@ def simulate_physical_response(state, inputs, actions):
             "ventilation_fault",
             "smoke_detected",
             "water_leak_detected",
+            "recovery_boost",
+            "cycle_reset",
         ]:
             next_state[key] = value
+
+    if inputs.get("cycle_reset", False):
+        state = state.copy()
+        state["co2_ppm"] = 620
+        state["indoor_temperature_c"] = 22.2
+        state["relative_humidity_percent"] = 45
+        state["pm10_ug_m3"] = 14
+        state["tvoc_ug_m3"] = 240
+        state["formaldehyde_ug_m3"] = 14
+        state["co_ppm"] = 0.4
+        state["oxygen_percent"] = 20.9
+        state["battery_percent"] = 100
+        state["comfort_score"] = compute_comfort_score(state, get_thresholds(inputs["space_mode"]))
 
     people = inputs["occupancy"]
     ventilation = actions["ventilation"]
@@ -619,9 +659,18 @@ def simulate_physical_response(state, inputs, actions):
     heating = actions["heating"]
 
     # CO2 dynamics
-    co2_generation = people * 1.25
-    co2_removal = (ventilation / 100) * (state["co2_ppm"] - 420) * 0.28
-    next_state["co2_ppm"] = clamp(state["co2_ppm"] + co2_generation - co2_removal, 420, 5000)
+    # The loop is tuned so that bad states are visible, but corrective ventilation
+    # can bring the room back to an acceptable/green state within a few steps.
+    co2_generation_factor = 0.60 if inputs["space_mode"] == "coworking" else 0.42
+    removal_factor = 0.50 if not inputs.get("recovery_boost", False) else 0.72
+
+    co2_generation = people * co2_generation_factor
+    co2_removal = (ventilation / 100) * max(state["co2_ppm"] - 420, 0) * removal_factor
+
+    if inputs.get("recovery_boost", False):
+        co2_removal += max(state["co2_ppm"] - 650, 0) * 0.16
+
+    next_state["co2_ppm"] = clamp(state["co2_ppm"] + co2_generation - co2_removal, 420, 2500)
 
     # Temperature dynamics
     # The room is treated as a basement / semi-basement space with high thermal inertia.
@@ -651,33 +700,40 @@ def simulate_physical_response(state, inputs, actions):
     )
 
     # Humidity dynamics
-    # Humidity can rise in a crowded shelter, but values should remain within plausible indoor ranges.
-    humidity_generation = people * 0.006
-    humidity_exchange = (ventilation / 100) * (inputs["outside_humidity_percent"] - state["relative_humidity_percent"]) * 0.035
-    max_humidity = 82 if inputs["space_mode"] == "shelter" else 75
+    # Humidity can rise in a crowded shelter, but control + lower occupancy should bring it down again.
+    humidity_generation = people * (0.0030 if inputs["space_mode"] == "coworking" else 0.0022)
+    humidity_exchange = (ventilation / 100) * (inputs["outside_humidity_percent"] - state["relative_humidity_percent"]) * 0.060
+
+    humidity_recovery = 0
+    if inputs.get("recovery_boost", False):
+        humidity_recovery = (state["relative_humidity_percent"] - 50) * 0.10
+
+    max_humidity = 74 if inputs["space_mode"] == "shelter" else 68
     next_state["relative_humidity_percent"] = clamp(
-        state["relative_humidity_percent"] + humidity_generation + humidity_exchange,
-        25,
+        state["relative_humidity_percent"] + humidity_generation + humidity_exchange - humidity_recovery,
+        30,
         max_humidity,
     )
 
     # Pollution dynamics
+    recovery_multiplier = 1.6 if inputs.get("recovery_boost", False) else 1.0
+
     next_state["pm10_ug_m3"] = clamp(
-        state["pm10_ug_m3"] + people * 0.02 + inputs["event_pm10"] - (filtration / 100) * state["pm10_ug_m3"] * 0.18,
+        state["pm10_ug_m3"] + people * 0.012 + inputs["event_pm10"] - (filtration / 100) * state["pm10_ug_m3"] * 0.22 * recovery_multiplier,
         2,
-        200,
+        160,
     )
 
     next_state["tvoc_ug_m3"] = clamp(
-        state["tvoc_ug_m3"] + people * 0.45 + inputs["event_tvoc"] - (filtration / 100) * state["tvoc_ug_m3"] * 0.12 - (ventilation / 100) * state["tvoc_ug_m3"] * 0.04,
+        state["tvoc_ug_m3"] + people * 0.28 + inputs["event_tvoc"] - (filtration / 100) * state["tvoc_ug_m3"] * 0.16 * recovery_multiplier - (ventilation / 100) * state["tvoc_ug_m3"] * 0.06 * recovery_multiplier,
         50,
-        2500,
+        1600,
     )
 
     next_state["formaldehyde_ug_m3"] = clamp(
-        state["formaldehyde_ug_m3"] + people * 0.01 - (filtration / 100) * state["formaldehyde_ug_m3"] * 0.05,
+        state["formaldehyde_ug_m3"] + people * 0.006 - (filtration / 100) * state["formaldehyde_ug_m3"] * 0.07 * recovery_multiplier,
         3,
-        200,
+        120,
     )
 
     # CO and oxygen
@@ -902,7 +958,7 @@ def render_simulation_frame():
             <div style="font-size: 1.6rem; font-weight: 800;">{state['situation']}</div>
             <div style="font-size: 1rem; opacity: 0.85;">
                 Space mode: <b>{mode_label}</b> · Step: <b>{step}</b> · 
-                The loop updates every 0.3s: sensors → forecast → control action → changed room state → next sensor state.
+                The demo loops: green coworking → worsening → control recovery → emergency shelter → worsening → control recovery.
             </div>
         </div>
         """,
