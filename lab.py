@@ -111,7 +111,16 @@ def compute_ieq_metrics(state, thresholds):
 
     # 2) Air quality dissatisfaction.
     # The presentation shows dissatisfaction increasing with air pollution concentration.
-    co2_dissatisfied = clamp((co2 - 700) / max(thresholds["co2_crit"] - 700, 1) * 75, 0, 90)
+    # CO2 effect:
+    # < 1000 ppm: acceptable;
+    # 1000-1400 ppm: stuffiness, sleepiness and concentration decline;
+    # > 1400 ppm: strong productivity and attention risk.
+    if co2 <= 1000:
+        co2_dissatisfied = clamp((co2 - 700) / 300 * 20, 0, 20)
+    elif co2 <= 1400:
+        co2_dissatisfied = clamp(20 + (co2 - 1000) / 400 * 45, 20, 65)
+    else:
+        co2_dissatisfied = clamp(65 + (co2 - 1400) / 600 * 30, 65, 95)
     pm10_dissatisfied = clamp((pm10 - 10) / max(thresholds["pm10_warn"] * 2 - 10, 1) * 55, 0, 80)
     tvoc_dissatisfied = clamp((tvoc - 200) / max(thresholds["tvoc_crit"] - 200, 1) * 75, 0, 90)
     hcho_dissatisfied = clamp((hcho - 10) / max(thresholds["hcho_warn"] * 2 - 10, 1) * 50, 0, 75)
@@ -178,6 +187,15 @@ def compute_comfort_score(state, thresholds):
     return compute_ieq_metrics(state, thresholds)["comfort_score"]
 
 
+def co2_effect_label(co2):
+    co2 = float(co2)
+    if co2 < 1000:
+        return "acceptable"
+    if co2 <= 1400:
+        return "stuffiness / lower concentration"
+    return "critical productivity risk"
+
+
 # ============================================================
 # DATA LOADING
 # ============================================================
@@ -200,10 +218,10 @@ def load_dataset_if_available():
 def get_thresholds(space_mode):
     if space_mode == "shelter":
         return {
-            "co2_warn": 1500,
-            "co2_crit": 2200,
-            "temp_min": 16,
-            "temp_max": 28,
+            "co2_warn": 1000,
+            "co2_crit": 1400,
+            "temp_min": 17,
+            "temp_max": 24,
             "humidity_min": 30,
             "humidity_max": 70,
             "pm10_warn": 75,
@@ -223,7 +241,7 @@ def get_thresholds(space_mode):
 
     return {
         "co2_warn": 1000,
-        "co2_crit": 1500,
+        "co2_crit": 1400,
         "temp_min": 20,
         "temp_max": 24,
         "humidity_min": 40,
@@ -297,8 +315,8 @@ def scenario_inputs(simulation_mode, step):
         elif local < 150:
             base["situation"] = "overheating risk"
             base["occupancy"] = 48
-            base["outside_temperature_c"] = 31
-            base["event_heat"] = 0.35
+            base["outside_temperature_c"] = 29
+            base["event_heat"] = 0.10
         elif local < 185:
             base["situation"] = "poor air quality"
             base["occupancy"] = 45
@@ -353,8 +371,8 @@ def scenario_inputs(simulation_mode, step):
             base["space_mode"] = "coworking"
             base["situation"] = "overheating before emergency"
             base["occupancy"] = 45
-            base["outside_temperature_c"] = 31
-            base["event_heat"] = 0.35
+            base["outside_temperature_c"] = 29
+            base["event_heat"] = 0.10
         elif phase < 205:
             base["space_mode"] = "shelter"
             base["situation"] = "emergency transition"
@@ -486,11 +504,11 @@ def decide_actions(state, inputs, forecast_no_action):
     # CO2 proactive control
     if co2_now > thresholds["co2_warn"] or co2_future > thresholds["co2_warn"]:
         actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
-        notes.append("Prediction shows CO₂ risk → ventilation increased before the state becomes unsafe.")
+        notes.append("CO₂ is expected to enter the 1000–1400 ppm range → stuffiness, sleepiness and lower concentration risk. Ventilation increased proactively.")
 
     if co2_now > thresholds["co2_crit"] or co2_future > thresholds["co2_crit"]:
         actions["ventilation"] = 100
-        notes.append("Critical CO₂ risk → maximum ventilation selected.")
+        notes.append("CO₂ is expected to exceed 1400 ppm → strong productivity and attention risk. Maximum ventilation selected.")
 
     # Occupancy
     if occupancy_ratio > 0.85:
@@ -605,22 +623,41 @@ def simulate_physical_response(state, inputs, actions):
     next_state["co2_ppm"] = clamp(state["co2_ppm"] + co2_generation - co2_removal, 420, 5000)
 
     # Temperature dynamics
-    people_heat = people * 0.006
-    outside_exchange = (ventilation / 100) * (inputs["outside_temperature_c"] - state["indoor_temperature_c"]) * 0.05
-    hvac_effect = (heating / 100) * 1.0 - (cooling / 100) * 1.2
+    # The room is treated as a basement / semi-basement space with high thermal inertia.
+    # Therefore, even during heat waves, indoor temperature changes slowly and should not reach 35 °C.
+    if inputs["space_mode"] == "shelter":
+        thermal_inertia = 0.018
+        people_heat_factor = 0.0012
+        hvac_heat_effect = 0.35
+        hvac_cool_effect = 0.45
+        min_indoor_temp = 14.0
+        max_indoor_temp = 26.0
+    else:
+        thermal_inertia = 0.025
+        people_heat_factor = 0.0018
+        hvac_heat_effect = 0.45
+        hvac_cool_effect = 0.55
+        min_indoor_temp = 16.0
+        max_indoor_temp = 28.0
+
+    people_heat = people * people_heat_factor
+    outside_exchange = (ventilation / 100) * (inputs["outside_temperature_c"] - state["indoor_temperature_c"]) * thermal_inertia
+    hvac_effect = (heating / 100) * hvac_heat_effect - (cooling / 100) * hvac_cool_effect
     next_state["indoor_temperature_c"] = clamp(
         state["indoor_temperature_c"] + people_heat + outside_exchange + hvac_effect + inputs["event_heat"],
-        10,
-        35,
+        min_indoor_temp,
+        max_indoor_temp,
     )
 
     # Humidity dynamics
-    humidity_generation = people * 0.015
-    humidity_exchange = (ventilation / 100) * (inputs["outside_humidity_percent"] - state["relative_humidity_percent"]) * 0.04
+    # Humidity can rise in a crowded shelter, but values should remain within plausible indoor ranges.
+    humidity_generation = people * 0.006
+    humidity_exchange = (ventilation / 100) * (inputs["outside_humidity_percent"] - state["relative_humidity_percent"]) * 0.035
+    max_humidity = 82 if inputs["space_mode"] == "shelter" else 75
     next_state["relative_humidity_percent"] = clamp(
         state["relative_humidity_percent"] + humidity_generation + humidity_exchange,
-        20,
-        90,
+        25,
+        max_humidity,
     )
 
     # Pollution dynamics
@@ -845,7 +882,7 @@ def render_simulation_frame():
 
     st.subheader("1. Sensor input: current measured room state")
 
-    sensor_cols = st.columns(7)
+    sensor_cols = st.columns(8)
 
     with sensor_cols[0]:
         st.metric("People", int(state["occupancy"]))
@@ -868,6 +905,9 @@ def render_simulation_frame():
     with sensor_cols[6]:
         st.metric("Dissatisfied", f"{state.get('dissatisfied_percent', 100 - state['comfort_score']):.0f}%")
 
+    with sensor_cols[7]:
+        st.metric("CO₂ effect", co2_effect_label(state["co2_ppm"]))
+
 
     # ============================================================
     # STEPS 2–4 — CLOSED LOOP TABLE
@@ -877,9 +917,10 @@ def render_simulation_frame():
 
     closed_loop_table = pd.DataFrame(
         {
-            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort", "Dissatisfied", "Thermal discomfort"],
+            "Indicator": ["CO₂", "CO₂ effect", "Temperature", "Humidity", "TVOC", "Battery", "Comfort", "Dissatisfied", "Thermal discomfort"],
             "1. Current sensor state": [
                 f"{state['co2_ppm']:.0f} ppm",
+                co2_effect_label(state["co2_ppm"]),
                 f"{state['indoor_temperature_c']:.1f} °C",
                 f"{state['relative_humidity_percent']:.0f}%",
                 f"{state['tvoc_ug_m3']:.0f} μg/m³",
@@ -890,6 +931,7 @@ def render_simulation_frame():
             ],
             "2. Predicted in 10 min without action": [
                 f"{forecast_no_action['co2_ppm']:.0f} ppm",
+                co2_effect_label(forecast_no_action["co2_ppm"]),
                 f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
                 f"{forecast_no_action['relative_humidity_percent']:.0f}%",
                 f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
@@ -900,6 +942,7 @@ def render_simulation_frame():
             ],
             "4. Predicted in 10 min after action": [
                 f"{forecast_after_action['co2_ppm']:.0f} ppm",
+                co2_effect_label(forecast_after_action["co2_ppm"]),
                 f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
                 f"{forecast_after_action['relative_humidity_percent']:.0f}%",
                 f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
