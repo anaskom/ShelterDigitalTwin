@@ -8,20 +8,19 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-
 # ============================================================
 # PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="Coworking + Shelter Digital Twin",
+    page_title="Adaptive Coworking + Shelter Digital Twin",
     page_icon="🏫",
-    layout="wide"
+    layout="wide",
 )
 
 
 # ============================================================
-# DATA LOADING
+# CONSTANTS
 # ============================================================
 
 DEFAULT_DATA_PATHS = [
@@ -29,120 +28,102 @@ DEFAULT_DATA_PATHS = [
     Path("coworking_shelter_sensor_dataset.csv"),
 ]
 
+HORIZON_STEPS = 2          # 2 steps * 5 min = 10 min forecast
+STEP_MINUTES = 5
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def clamp(value, low, high):
+    return float(np.clip(value, low, high))
+
+
+def status_color_from_state(state, thresholds):
+    if (
+        state["co2_ppm"] > thresholds["co2_crit"]
+        or state["tvoc_ug_m3"] > thresholds["tvoc_crit"]
+        or state["co_ppm"] > thresholds["co_crit"]
+        or state["oxygen_percent"] < thresholds["oxygen_min"]
+        or state["battery_percent"] < thresholds["battery_crit"]
+        or state.get("smoke_detected", False)
+    ):
+        return "Critical", "#F44336"
+
+    if (
+        state["co2_ppm"] > thresholds["co2_warn"]
+        or state["indoor_temperature_c"] < thresholds["temp_min"]
+        or state["indoor_temperature_c"] > thresholds["temp_max"]
+        or state["relative_humidity_percent"] < thresholds["humidity_min"]
+        or state["relative_humidity_percent"] > thresholds["humidity_max"]
+        or state["tvoc_ug_m3"] > thresholds["tvoc_warn"]
+        or state["noise_dba"] > thresholds["noise_warn"]
+        or state["occupancy"] / max(state["active_capacity"], 1) > 0.85
+        or state.get("water_leak_detected", False)
+    ):
+        return "Warning", "#FFC107"
+
+    return "Optimal", "#4CAF50"
+
+
+def compute_comfort_score(state, thresholds):
+    score = 100.0
+
+    # CO2 penalty
+    if state["co2_ppm"] > thresholds["co2_warn"]:
+        score -= min(30, (state["co2_ppm"] - thresholds["co2_warn"]) / 35)
+
+    # Temperature penalty
+    if state["indoor_temperature_c"] < thresholds["temp_min"]:
+        score -= min(25, (thresholds["temp_min"] - state["indoor_temperature_c"]) * 6)
+    if state["indoor_temperature_c"] > thresholds["temp_max"]:
+        score -= min(25, (state["indoor_temperature_c"] - thresholds["temp_max"]) * 6)
+
+    # Humidity penalty
+    if state["relative_humidity_percent"] < thresholds["humidity_min"]:
+        score -= min(15, (thresholds["humidity_min"] - state["relative_humidity_percent"]) * 0.7)
+    if state["relative_humidity_percent"] > thresholds["humidity_max"]:
+        score -= min(15, (state["relative_humidity_percent"] - thresholds["humidity_max"]) * 0.7)
+
+    # Pollution / safety / crowding
+    if state["pm10_ug_m3"] > thresholds["pm10_warn"]:
+        score -= min(15, (state["pm10_ug_m3"] - thresholds["pm10_warn"]) * 0.25)
+    if state["tvoc_ug_m3"] > thresholds["tvoc_warn"]:
+        score -= min(20, (state["tvoc_ug_m3"] - thresholds["tvoc_warn"]) * 0.025)
+
+    occupancy_ratio = state["occupancy"] / max(state["active_capacity"], 1)
+    if occupancy_ratio > 0.85:
+        score -= min(15, (occupancy_ratio - 0.85) * 60)
+
+    if state["battery_percent"] < thresholds["battery_warn"]:
+        score -= min(10, (thresholds["battery_warn"] - state["battery_percent"]) * 0.4)
+
+    return clamp(score, 0, 100)
+
+
+# ============================================================
+# DATA LOADING
+# ============================================================
 
 @st.cache_data
-def load_dataset_from_path(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    return prepare_dataset(df)
-
-
-@st.cache_data
-def load_dataset_from_upload(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
-    return prepare_dataset(df)
-
-
-def prepare_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
-    numeric_columns = [
-        "occupancy",
-        "active_capacity",
-        "coworking_capacity",
-        "emergency_capacity",
-        "floor_area_m2",
-        "co2_ppm",
-        "indoor_temperature_c",
-        "relative_humidity_percent",
-        "pm10_ug_m3",
-        "tvoc_ug_m3",
-        "formaldehyde_ug_m3",
-        "co_ppm",
-        "oxygen_percent",
-        "noise_dba",
-        "indoor_light_lux",
-        "daylight_lux",
-        "outside_temperature_c",
-        "battery_percent",
-        "energy_use_kw",
-        "comfort_score",
-        "ventilation_level_percent",
-        "outside_air_intake_percent",
-        "filtration_level_percent",
-        "heating_level_percent",
-        "cooling_level_percent",
-        "lighting_level_percent",
-        "blinds_closed_percent",
-        "estimated_air_changes_per_hour",
-        "estimated_airflow_lps",
-    ]
-
-    for col in numeric_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    binary_columns = [
-        "alarm",
-        "grid_available",
-        "backup_power_only",
-        "smoke_detected",
-        "water_leak_detected",
-        "door_open",
-        "window_open",
-        "ventilation_fault",
-        "is_unsafe",
-    ]
-
-    for col in binary_columns:
-        if col in df.columns:
-            df[col] = df[col].fillna(0).astype(int)
-
-    # Fallbacks for missing columns
-    if "mode" not in df.columns:
-        df["mode"] = "coworking"
-
-    if "planned_scenario" not in df.columns:
-        df["planned_scenario"] = "normal"
-
-    if "active_capacity" not in df.columns:
-        if "coworking_capacity" in df.columns:
-            df["active_capacity"] = df["coworking_capacity"]
-        elif "shelter_capacity" in df.columns:
-            df["active_capacity"] = df["shelter_capacity"]
-        else:
-            df["active_capacity"] = 60
-
-    if "floor_area_m2" not in df.columns:
-        df["floor_area_m2"] = 150
-
-    return df.reset_index(drop=True)
-
-
-def find_default_dataset_path():
+def load_dataset_if_available():
     for path in DEFAULT_DATA_PATHS:
         if path.exists():
-            return path
-    return None
-
-
-def get_value(row: pd.Series, col: str, default=0):
-    if col in row.index and pd.notna(row[col]):
-        return row[col]
-    return default
+            df = pd.read_csv(path)
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            return df
+    return pd.DataFrame()
 
 
 # ============================================================
-# THRESHOLDS
+# MODES AND THRESHOLDS
 # ============================================================
 
-def get_thresholds(mode: str) -> dict:
-    if mode == "emergency_shelter":
+def get_thresholds(space_mode):
+    if space_mode == "shelter":
         return {
-            "label": "Emergency shelter mode",
-            "goal": "Healthy minimum conditions + maximum battery autonomy",
             "co2_warn": 1500,
             "co2_crit": 2200,
             "temp_min": 16,
@@ -157,17 +138,14 @@ def get_thresholds(mode: str) -> dict:
             "co_crit": 30,
             "oxygen_min": 19.5,
             "noise_warn": 75,
-            "lux_target": 100,
             "battery_warn": 50,
             "battery_crit": 10,
-            "base_ventilation": 15,
-            "high_ventilation": 55,
-            "glare_lux": 1200,
+            "base_ventilation": 18,
+            "high_ventilation": 60,
+            "lux_target": 120,
         }
 
     return {
-        "label": "Coworking mode",
-        "goal": "Comfort + productivity + energy efficiency",
         "co2_warn": 1000,
         "co2_crit": 1500,
         "temp_min": 20,
@@ -182,556 +160,566 @@ def get_thresholds(mode: str) -> dict:
         "co_crit": 30,
         "oxygen_min": 19.5,
         "noise_warn": 55,
-        "lux_target": 500,
         "battery_warn": 30,
         "battery_crit": 10,
         "base_ventilation": 25,
         "high_ventilation": 75,
-        "glare_lux": 1000,
+        "lux_target": 500,
     }
 
+
+def scenario_inputs(simulation_mode, step):
+    """
+    External world / sensor-driving events.
+
+    This is what happens TO the room:
+    - people arrive or leave;
+    - outside temperature changes;
+    - daylight changes;
+    - emergency starts;
+    - power outage or ventilation fault happens.
+
+    The indoor state itself is NOT overwritten here.
+    It evolves later through the physical response function.
+    """
+    phase = step % 360
+    hour = (8 + step / 12) % 24
+    daylight = max(0, 850 * np.sin(np.pi * (hour - 6) / 14))
+    outside_temp = 18 + 6 * np.sin(2 * np.pi * (step % 288) / 288)
+
+    base = {
+        "space_mode": "coworking",
+        "situation": "normal coworking",
+        "occupancy": 18,
+        "active_capacity": 60,
+        "outside_temperature_c": outside_temp,
+        "outside_humidity_percent": 50,
+        "daylight_lux": daylight,
+        "grid_available": True,
+        "backup_power_only": False,
+        "ventilation_fault": False,
+        "smoke_detected": False,
+        "water_leak_detected": False,
+        "event_pm10": 0,
+        "event_tvoc": 0,
+        "event_heat": 0,
+        "event_noise": 0,
+    }
+
+    if simulation_mode == "Coworking only":
+        local = step % 240
+        base["space_mode"] = "coworking"
+        base["active_capacity"] = 60
+
+        if local < 60:
+            base["situation"] = "normal coworking"
+            base["occupancy"] = int(12 + local * 0.35)
+        elif local < 105:
+            base["situation"] = "crowded coworking"
+            base["occupancy"] = int(42 + 10 * np.sin(local / 8))
+            base["event_noise"] = 8
+        elif local < 150:
+            base["situation"] = "overheating risk"
+            base["occupancy"] = 48
+            base["outside_temperature_c"] = 31
+            base["event_heat"] = 0.35
+        elif local < 185:
+            base["situation"] = "poor air quality"
+            base["occupancy"] = 45
+            base["event_tvoc"] = 45
+            base["event_pm10"] = 3
+        else:
+            base["situation"] = "stabilized coworking"
+            base["occupancy"] = 22
+
+    elif simulation_mode == "Shelter only":
+        local = step % 240
+        base["space_mode"] = "shelter"
+        base["active_capacity"] = 220
+        base["daylight_lux"] = min(base["daylight_lux"], 120)
+
+        if local < 60:
+            base["situation"] = "air alarm shelter mode"
+            base["occupancy"] = int(90 + local * 1.2)
+        elif local < 120:
+            base["situation"] = "crowded shelter"
+            base["occupancy"] = 175
+            base["event_noise"] = 12
+        elif local < 170:
+            base["situation"] = "backup power mode"
+            base["occupancy"] = 160
+            base["grid_available"] = False
+            base["backup_power_only"] = True
+        elif local < 205:
+            base["situation"] = "limited ventilation"
+            base["occupancy"] = 150
+            base["grid_available"] = False
+            base["backup_power_only"] = True
+            base["ventilation_fault"] = True
+        else:
+            base["situation"] = "shelter stabilization"
+            base["occupancy"] = 115
+            base["grid_available"] = True
+            base["backup_power_only"] = False
+
+    else:
+        # Full transition: coworking -> emergency -> shelter stabilization
+        if phase < 75:
+            base["space_mode"] = "coworking"
+            base["situation"] = "normal coworking"
+            base["occupancy"] = int(10 + phase * 0.4)
+        elif phase < 125:
+            base["space_mode"] = "coworking"
+            base["situation"] = "crowded coworking"
+            base["occupancy"] = 48
+            base["event_noise"] = 8
+        elif phase < 165:
+            base["space_mode"] = "coworking"
+            base["situation"] = "overheating before emergency"
+            base["occupancy"] = 45
+            base["outside_temperature_c"] = 31
+            base["event_heat"] = 0.35
+        elif phase < 205:
+            base["space_mode"] = "shelter"
+            base["situation"] = "emergency transition"
+            base["active_capacity"] = 220
+            base["occupancy"] = int(80 + (phase - 165) * 2.2)
+            base["daylight_lux"] = min(base["daylight_lux"], 100)
+            base["event_noise"] = 15
+        elif phase < 265:
+            base["space_mode"] = "shelter"
+            base["situation"] = "power outage in shelter"
+            base["active_capacity"] = 220
+            base["occupancy"] = 170
+            base["grid_available"] = False
+            base["backup_power_only"] = True
+            base["daylight_lux"] = 60
+            base["event_noise"] = 12
+        elif phase < 315:
+            base["space_mode"] = "shelter"
+            base["situation"] = "ventilation fault in shelter"
+            base["active_capacity"] = 220
+            base["occupancy"] = 150
+            base["grid_available"] = False
+            base["backup_power_only"] = True
+            base["ventilation_fault"] = True
+            base["daylight_lux"] = 40
+        else:
+            base["space_mode"] = "shelter"
+            base["situation"] = "shelter stabilization"
+            base["active_capacity"] = 220
+            base["occupancy"] = 115
+            base["grid_available"] = True
+            base["backup_power_only"] = False
+            base["daylight_lux"] = 80
+
+    return base
 
 
 # ============================================================
-# AI / ML PREDICTION MODULE WITHOUT EXTERNAL ML LIBRARIES
+# INITIAL STATE
 # ============================================================
 
-NUMERIC_FEATURES = [
-    "occupancy",
-    "active_capacity",
-    "floor_area_m2",
-    "co2_ppm",
-    "indoor_temperature_c",
-    "relative_humidity_percent",
-    "pm10_ug_m3",
-    "tvoc_ug_m3",
-    "formaldehyde_ug_m3",
-    "co_ppm",
-    "oxygen_percent",
-    "noise_dba",
-    "indoor_light_lux",
-    "daylight_lux",
-    "outside_temperature_c",
-    "battery_percent",
-    "energy_use_kw",
-    "ventilation_level_percent",
-    "outside_air_intake_percent",
-    "filtration_level_percent",
-    "heating_level_percent",
-    "cooling_level_percent",
-    "lighting_level_percent",
-    "estimated_air_changes_per_hour",
-    "estimated_airflow_lps",
-]
-
-CATEGORICAL_FEATURES = [
-    "mode",
-    "planned_scenario",
-    "power_state",
-    "ventilation_state",
-]
-
-
-def get_existing_features(df: pd.DataFrame):
-    numeric = [col for col in NUMERIC_FEATURES if col in df.columns]
-    categorical = [col for col in CATEGORICAL_FEATURES if col in df.columns]
-    return numeric, categorical
-
-
-def build_feature_matrix(df: pd.DataFrame, numeric_features: list, categorical_features: list, dummy_columns=None):
-    """
-    Builds a numeric feature matrix using pandas/numpy only.
-    This avoids scikit-learn dependency on Streamlit Cloud.
-    """
-    parts = []
-
-    if numeric_features:
-        numeric_df = df[numeric_features].copy()
-        numeric_df = numeric_df.apply(pd.to_numeric, errors="coerce")
-        numeric_df = numeric_df.fillna(numeric_df.median(numeric_only=True))
-        numeric_df = numeric_df.fillna(0)
-        parts.append(numeric_df)
-
-    if categorical_features:
-        cat_df = df[categorical_features].copy().fillna("unknown").astype(str)
-        cat_dummies = pd.get_dummies(cat_df, columns=categorical_features, dtype=float)
-
-        if dummy_columns is not None:
-            cat_dummies = cat_dummies.reindex(columns=dummy_columns, fill_value=0)
-
-        parts.append(cat_dummies)
-
-    if not parts:
-        matrix_df = pd.DataFrame(index=df.index)
+def initial_state(simulation_mode):
+    if simulation_mode == "Shelter only":
+        mode = "shelter"
+        capacity = 220
+        people = 90
+        temp = 23.0
+        co2 = 760
+        daylight = 80
     else:
-        matrix_df = pd.concat(parts, axis=1)
+        mode = "coworking"
+        capacity = 60
+        people = 15
+        temp = 22.2
+        co2 = 620
+        daylight = 500
 
-    return matrix_df.astype(float)
+    thresholds = get_thresholds(mode)
 
-
-@st.cache_resource
-def train_ai_models(df: pd.DataFrame, horizon_steps: int = 2):
-    """
-    Lightweight ML-style predictor trained on the loaded sensor dataset.
-
-    It uses nearest-neighbor matching:
-    - finds past states similar to the current state;
-    - averages what happened after those states;
-    - returns a forecast for CO₂, temperature, comfort score and unsafe risk.
-
-    horizon_steps=2 means approximately 10 minutes ahead if the dataset interval is 5 minutes.
-    """
-    data = df.copy()
-
-    required_targets = ["co2_ppm", "indoor_temperature_c", "comfort_score", "is_unsafe"]
-    missing = [col for col in required_targets if col not in data.columns]
-    if missing:
-        return None, {"error": f"Missing columns for AI model: {missing}"}
-
-    data["future_co2_ppm"] = data["co2_ppm"].shift(-horizon_steps)
-    data["future_temperature_c"] = data["indoor_temperature_c"].shift(-horizon_steps)
-    data["future_comfort_score"] = data["comfort_score"].shift(-horizon_steps)
-    data["future_is_unsafe"] = data["is_unsafe"].shift(-horizon_steps)
-
-    target_cols = [
-        "future_co2_ppm",
-        "future_temperature_c",
-        "future_comfort_score",
-        "future_is_unsafe",
-    ]
-
-    data = data.dropna(subset=target_cols).reset_index(drop=True)
-
-    if len(data) < 100:
-        return None, {"error": "Not enough rows to train the AI model."}
-
-    numeric_features, categorical_features = get_existing_features(data)
-    feature_df = build_feature_matrix(data, numeric_features, categorical_features)
-    dummy_columns = [
-        col for col in feature_df.columns
-        if any(col.startswith(f"{cat}_") for cat in categorical_features)
-    ]
-
-    feature_values = feature_df.to_numpy(dtype=float)
-
-    split_idx = int(len(data) * 0.8)
-    split_idx = max(50, min(split_idx, len(data) - 20))
-
-    x_train = feature_values[:split_idx]
-    x_test = feature_values[split_idx:]
-
-    y_train = data[target_cols].iloc[:split_idx].to_numpy(dtype=float)
-    y_test = data[target_cols].iloc[split_idx:].to_numpy(dtype=float)
-
-    feature_mean = np.nanmean(x_train, axis=0)
-    feature_std = np.nanstd(x_train, axis=0)
-    feature_std[feature_std == 0] = 1
-
-    x_train_scaled = (x_train - feature_mean) / feature_std
-    x_test_scaled = (x_test - feature_mean) / feature_std
-
-    # Limit stored rows to keep Streamlit Cloud fast
-    max_train_rows = 8000
-    if len(x_train_scaled) > max_train_rows:
-        rng = np.random.default_rng(42)
-        keep_idx = rng.choice(len(x_train_scaled), size=max_train_rows, replace=False)
-        x_store = x_train_scaled[keep_idx]
-        y_store = y_train[keep_idx]
-    else:
-        x_store = x_train_scaled
-        y_store = y_train
-
-    def knn_predict_batch(x_batch, k=25):
-        predictions = []
-        for x in x_batch:
-            distances = np.mean((x_store - x) ** 2, axis=1)
-            nearest_idx = np.argpartition(distances, min(k, len(distances) - 1))[:k]
-            nearest_dist = distances[nearest_idx]
-            weights = 1 / (nearest_dist + 1e-6)
-            weights = weights / weights.sum()
-            predictions.append(np.sum(y_store[nearest_idx] * weights[:, None], axis=0))
-        return np.array(predictions)
-
-    # Evaluate on a sample to avoid heavy calculations
-    max_test_rows = 1000
-    if len(x_test_scaled) > max_test_rows:
-        eval_idx = np.linspace(0, len(x_test_scaled) - 1, max_test_rows).astype(int)
-        x_eval = x_test_scaled[eval_idx]
-        y_eval = y_test[eval_idx]
-    else:
-        x_eval = x_test_scaled
-        y_eval = y_test
-
-    pred_eval = knn_predict_batch(x_eval, k=25)
-
-    co2_mae = float(np.mean(np.abs(y_eval[:, 0] - pred_eval[:, 0])))
-    temperature_mae = float(np.mean(np.abs(y_eval[:, 1] - pred_eval[:, 1])))
-    comfort_mae = float(np.mean(np.abs(y_eval[:, 2] - pred_eval[:, 2])))
-    unsafe_pred = (pred_eval[:, 3] >= 0.5).astype(int)
-    unsafe_true = y_eval[:, 3].astype(int)
-    unsafe_accuracy = float(np.mean(unsafe_pred == unsafe_true))
-
-    metrics = {
-        "co2_mae": co2_mae,
-        "temperature_mae": temperature_mae,
-        "comfort_mae": comfort_mae,
-        "unsafe_accuracy": unsafe_accuracy,
-        "numeric_features": numeric_features,
-        "categorical_features": categorical_features,
-        "dummy_columns": dummy_columns,
-        "feature_columns": list(feature_df.columns),
-        "feature_mean": feature_mean,
-        "feature_std": feature_std,
+    state = {
+        "step": 0,
+        "space_mode": mode,
+        "situation": "initial state",
+        "occupancy": people,
+        "active_capacity": capacity,
+        "floor_area_m2": 150,
+        "co2_ppm": co2,
+        "indoor_temperature_c": temp,
+        "relative_humidity_percent": 45,
+        "pm10_ug_m3": 14,
+        "tvoc_ug_m3": 240,
+        "formaldehyde_ug_m3": 14,
+        "co_ppm": 0.4,
+        "oxygen_percent": 20.9,
+        "noise_dba": 42,
+        "indoor_light_lux": 450,
+        "daylight_lux": daylight,
+        "outside_temperature_c": 18,
+        "battery_percent": 100,
+        "energy_use_kw": 1.2,
+        "comfort_score": 92,
+        "grid_available": True,
+        "backup_power_only": False,
+        "ventilation_fault": False,
+        "smoke_detected": False,
+        "water_leak_detected": False,
     }
 
-    model = {
-        "x_train_scaled": x_store,
-        "y_train": y_store,
-        "k": 25,
-    }
-
-    return model, metrics
+    state["comfort_score"] = compute_comfort_score(state, thresholds)
+    return state
 
 
-def predict_future_state(row: pd.Series, models: dict, numeric_features: list, categorical_features: list) -> dict:
-    if models is None:
-        return {}
+# ============================================================
+# PREDICTION AND CONTROL
+# ============================================================
 
-    current_df = pd.DataFrame([
-        {col: get_value(row, col, np.nan) for col in numeric_features + categorical_features}
-    ])
-
-    dummy_columns = st.session_state.get("ai_dummy_columns", None)
-
-    current_features = build_feature_matrix(
-        current_df,
-        numeric_features,
-        categorical_features,
-        dummy_columns=dummy_columns,
-    )
-
-    # Align to the exact feature columns used during training
-    feature_columns = st.session_state.get("ai_feature_columns", list(current_features.columns))
-    current_features = current_features.reindex(columns=feature_columns, fill_value=0)
-
-    x = current_features.to_numpy(dtype=float)
-    feature_mean = st.session_state["ai_feature_mean"]
-    feature_std = st.session_state["ai_feature_std"]
-    x_scaled = (x - feature_mean) / feature_std
-
-    x_train = models["x_train_scaled"]
-    y_train = models["y_train"]
-    k = min(models["k"], len(x_train))
-
-    distances = np.mean((x_train - x_scaled[0]) ** 2, axis=1)
-    nearest_idx = np.argpartition(distances, k - 1)[:k]
-    nearest_dist = distances[nearest_idx]
-    weights = 1 / (nearest_dist + 1e-6)
-    weights = weights / weights.sum()
-
-    prediction = np.sum(y_train[nearest_idx] * weights[:, None], axis=0)
-
-    unsafe_probability = float(np.clip(prediction[3], 0, 1))
-    unsafe_prediction = int(unsafe_probability >= 0.5)
-
+def baseline_actions(space_mode):
+    thresholds = get_thresholds(space_mode)
     return {
-        "future_co2_ppm": float(prediction[0]),
-        "future_temperature_c": float(prediction[1]),
-        "future_comfort_score": float(prediction[2]),
-        "future_is_unsafe": unsafe_prediction,
-        "unsafe_probability": unsafe_probability,
+        "ventilation": thresholds["base_ventilation"],
+        "outside_air_intake": thresholds["base_ventilation"],
+        "filtration": 15,
+        "heating": 0,
+        "cooling": 0,
+        "lighting": 20 if space_mode == "coworking" else 10,
+        "emergency_lights": 0,
+        "smoke_exhaust": 0,
+        "energy_saving": space_mode == "shelter",
+        "alarm_state": "OFF",
+        "exits_state": "Normal access",
+        "notes": [],
     }
 
 
-# ============================================================
-# DIGITAL TWIN DECISION LOGIC
-# ============================================================
+def decide_actions(state, inputs, forecast_no_action):
+    space_mode = inputs["space_mode"]
+    thresholds = get_thresholds(space_mode)
 
-def decide_actions(row: pd.Series, thresholds: dict) -> dict:
-    mode = str(get_value(row, "mode", "coworking"))
+    actions = baseline_actions(space_mode)
+    notes = []
 
-    occupancy = float(get_value(row, "occupancy", 0))
-    active_capacity = max(float(get_value(row, "active_capacity", 60)), 1)
-    floor_area = max(float(get_value(row, "floor_area_m2", 150)), 1)
+    co2_now = state["co2_ppm"]
+    co2_future = forecast_no_action["co2_ppm"]
+    temp_now = state["indoor_temperature_c"]
+    temp_future = forecast_no_action["indoor_temperature_c"]
+    occupancy_ratio = inputs["occupancy"] / max(inputs["active_capacity"], 1)
 
-    occupancy_ratio = occupancy / active_capacity
-    area_per_person = floor_area / occupancy if occupancy > 0 else np.inf
+    # CO2 proactive control
+    if co2_now > thresholds["co2_warn"] or co2_future > thresholds["co2_warn"]:
+        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
+        notes.append("Prediction shows CO₂ risk → ventilation increased before the state becomes unsafe.")
 
-    co2 = float(get_value(row, "co2_ppm", 420))
-    temp = float(get_value(row, "indoor_temperature_c", 22))
-    humidity = float(get_value(row, "relative_humidity_percent", 45))
-    pm10 = float(get_value(row, "pm10_ug_m3", 10))
-    tvoc = float(get_value(row, "tvoc_ug_m3", 250))
-    hcho = float(get_value(row, "formaldehyde_ug_m3", 10))
-    co = float(get_value(row, "co_ppm", 0))
-    oxygen = float(get_value(row, "oxygen_percent", 20.9))
-    noise = float(get_value(row, "noise_dba", 40))
-    daylight = float(get_value(row, "daylight_lux", 300))
-    outside_temp = float(get_value(row, "outside_temperature_c", temp))
-    battery = float(get_value(row, "battery_percent", 100))
+    if co2_now > thresholds["co2_crit"] or co2_future > thresholds["co2_crit"]:
+        actions["ventilation"] = 100
+        notes.append("Critical CO₂ risk → maximum ventilation selected.")
 
-    smoke = int(get_value(row, "smoke_detected", 0)) == 1
-    water_leak = int(get_value(row, "water_leak_detected", 0)) == 1
-    backup_power_only = int(get_value(row, "backup_power_only", 0)) == 1
-    ventilation_fault = int(get_value(row, "ventilation_fault", 0)) == 1
-
-    ventilation = 5 if occupancy == 0 else thresholds["base_ventilation"]
-    outside_air_intake = ventilation
-    filtration = 15
-    heating = 0
-    cooling = 0
-    lighting = 0
-    emergency_lights = 0
-    smoke_exhaust = 0
-
-    system_notes = []
-
-    # CO2 / occupancy
-    if co2 > thresholds["co2_warn"]:
-        ventilation = max(ventilation, thresholds["high_ventilation"])
-        system_notes.append("CO₂ is above the warning threshold → ventilation increased.")
-
-    if co2 > thresholds["co2_crit"]:
-        ventilation = 100
-        system_notes.append("CO₂ is critical → maximum ventilation required.")
-
+    # Occupancy
     if occupancy_ratio > 0.85:
-        ventilation = max(ventilation, thresholds["high_ventilation"])
-        system_notes.append("Occupancy is high → ventilation increased.")
+        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
+        notes.append("High occupancy → ventilation increased.")
 
-    if occupancy_ratio > 1.0:
-        system_notes.append("Space is overcrowded → occupancy warning activated.")
+    # Temperature proactive control
+    if temp_now > thresholds["temp_max"] or temp_future > thresholds["temp_max"]:
+        actions["cooling"] = max(actions["cooling"], min(100, (max(temp_now, temp_future) - thresholds["temp_max"]) * 35))
+        actions["ventilation"] = max(actions["ventilation"], 45)
+        notes.append("Prediction shows overheating → cooling activated proactively.")
+
+    if temp_now < thresholds["temp_min"] or temp_future < thresholds["temp_min"]:
+        actions["heating"] = max(actions["heating"], min(100, (thresholds["temp_min"] - min(temp_now, temp_future)) * 35))
+        notes.append("Prediction shows low temperature → heating activated proactively.")
 
     # Air pollution
-    if pm10 > thresholds["pm10_warn"]:
-        filtration = max(filtration, 80)
-        system_notes.append("PM10 is high → filtration increased.")
+    if state["pm10_ug_m3"] > thresholds["pm10_warn"]:
+        actions["filtration"] = max(actions["filtration"], 80)
+        notes.append("PM10 is high → filtration increased.")
 
-    if tvoc > thresholds["tvoc_warn"] or hcho > thresholds["hcho_warn"]:
-        ventilation = max(ventilation, 70)
-        filtration = 100
-        system_notes.append("VOC/formaldehyde is high → filtration and ventilation increased.")
+    if state["tvoc_ug_m3"] > thresholds["tvoc_warn"] or state["formaldehyde_ug_m3"] > thresholds["hcho_warn"]:
+        actions["filtration"] = 100
+        actions["ventilation"] = max(actions["ventilation"], 70)
+        notes.append("VOC/formaldehyde is high → filtration and ventilation increased.")
 
-    if co > thresholds["co_warn"] or oxygen < thresholds["oxygen_min"]:
-        ventilation = 100
-        filtration = 100
-        system_notes.append("CO/O₂ safety risk → maximum air exchange required.")
-
-    # Outside air follows the requested ventilation level
-    outside_air_intake = ventilation
-
-    # Temperature
-    if temp < thresholds["temp_min"]:
-        heating = min(100, (thresholds["temp_min"] - temp) * 30)
-        system_notes.append("Indoor temperature is too low → heating activated.")
-
-    if temp > thresholds["temp_max"]:
-        cooling = min(100, (temp - thresholds["temp_max"]) * 30)
-        ventilation = max(ventilation, 45)
-        system_notes.append("Indoor temperature is too high → cooling and ventilation increased.")
-
-    # Emergency mode: less comfort-focused HVAC
-    if mode == "emergency_shelter":
-        heating *= 0.5
-        cooling *= 0.5
-        emergency_lights = 60
-        system_notes.append("Emergency mode → HVAC is limited to save energy.")
+    if state["co_ppm"] > thresholds["co_warn"] or state["oxygen_percent"] < thresholds["oxygen_min"]:
+        actions["ventilation"] = 100
+        actions["filtration"] = 100
+        notes.append("CO/O₂ safety risk → maximum air exchange required.")
 
     # Lighting
     target_lux = thresholds["lux_target"]
-
-    if occupancy == 0:
+    if inputs["occupancy"] == 0:
         target_lux = 30
+    if space_mode == "shelter" and inputs["backup_power_only"]:
+        target_lux = 70
 
-    if mode == "emergency_shelter" and battery < 30:
-        target_lux = 50
-        system_notes.append("Low battery in emergency mode → light level reduced.")
+    artificial_needed = max(0, target_lux - inputs["daylight_lux"])
+    actions["lighting"] = clamp(artificial_needed / 650 * 100, 0, 100)
 
-    artificial_needed = max(0, target_lux - daylight)
-    lighting = min(100, artificial_needed / 650 * 100)
+    # Emergency / energy logic
+    if space_mode == "shelter":
+        actions["emergency_lights"] = 60
+        actions["exits_state"] = "Emergency exits unlocked"
+        actions["energy_saving"] = True
+        actions["heating"] *= 0.5
+        actions["cooling"] *= 0.5
+        notes.append("Shelter mode → comfort is reduced, safety and battery autonomy are prioritized.")
 
-    # Noise
-    if mode == "coworking" and noise > thresholds["noise_warn"]:
-        system_notes.append("Noise is high → quiet-zone alert activated.")
+    if inputs["backup_power_only"] or state["battery_percent"] < thresholds["battery_warn"]:
+        actions["energy_saving"] = True
+        actions["lighting"] *= 0.7
+        notes.append("Backup power / low battery → energy-saving logic is active.")
 
-    # Energy saving
-    energy_saving = False
-    if backup_power_only or battery < thresholds["battery_warn"] or mode == "emergency_shelter" or occupancy == 0:
-        energy_saving = True
+    if inputs["ventilation_fault"]:
+        actions["ventilation"] = min(actions["ventilation"], 25)
+        notes.append("Ventilation fault → ventilation capacity is limited.")
 
-    if energy_saving:
-        lighting *= 0.7
-        system_notes.append("Energy-saving logic is active.")
+    if inputs["smoke_detected"]:
+        actions["alarm_state"] = "FIRE ALARM"
+        actions["ventilation"] = 0
+        actions["outside_air_intake"] = 0
+        actions["smoke_exhaust"] = 100
+        actions["filtration"] = 100
+        actions["emergency_lights"] = 100
+        actions["exits_state"] = "Emergency exits unlocked"
+        notes.append("Smoke detected → smoke exhaust and emergency lighting activated.")
+    else:
+        actions["outside_air_intake"] = actions["ventilation"]
 
-    # Safety
-    alarm_state = "OFF"
-    exits_state = "Normal access"
+    for key in ["ventilation", "outside_air_intake", "filtration", "heating", "cooling", "lighting", "emergency_lights", "smoke_exhaust"]:
+        actions[key] = clamp(actions[key], 0, 100)
 
-    if mode == "emergency_shelter":
-        exits_state = "Emergency exits unlocked"
-
-    if ventilation_fault:
-        system_notes.append("Ventilation fault detected.")
-
-    if smoke:
-        alarm_state = "FIRE ALARM"
-        ventilation = 0
-        outside_air_intake = 0
-        smoke_exhaust = 100
-        filtration = 100
-        emergency_lights = 100
-        exits_state = "Emergency exits unlocked"
-        system_notes.append("Smoke detected → fire safety scenario activated.")
-
-    if water_leak:
-        system_notes.append("Water leak detected.")
-
-    return {
-        "occupancy_ratio": occupancy_ratio,
-        "area_per_person": area_per_person,
-        "ventilation": float(np.clip(ventilation, 0, 100)),
-        "outside_air_intake": float(np.clip(outside_air_intake, 0, 100)),
-        "filtration": float(np.clip(filtration, 0, 100)),
-        "heating": float(np.clip(heating, 0, 100)),
-        "cooling": float(np.clip(cooling, 0, 100)),
-        "lighting": float(np.clip(lighting, 0, 100)),
-        "emergency_lights": float(np.clip(emergency_lights, 0, 100)),
-        "smoke_exhaust": float(np.clip(smoke_exhaust, 0, 100)),
-        "energy_saving": energy_saving,
-        "alarm_state": alarm_state,
-        "exits_state": exits_state,
-        "notes": system_notes if system_notes else ["All indicators are within the target range."]
-    }
-
-
-
-def apply_ai_assistance(actions: dict, ai_prediction: dict, thresholds: dict) -> dict:
-    """
-    Adds proactive control: if AI predicts that conditions will get worse,
-    the system acts before the threshold is crossed.
-    """
-    actions = actions.copy()
-    notes = list(actions.get("notes", []))
-
-    if not ai_prediction:
-        actions["notes"] = notes
-        return actions
-
-    predicted_co2 = ai_prediction["future_co2_ppm"]
-    predicted_temp = ai_prediction["future_temperature_c"]
-    predicted_comfort = ai_prediction["future_comfort_score"]
-    unsafe_probability = ai_prediction["unsafe_probability"]
-
-    if predicted_co2 > thresholds["co2_warn"] and actions["ventilation"] < thresholds["high_ventilation"]:
-        actions["ventilation"] = thresholds["high_ventilation"]
-        actions["outside_air_intake"] = thresholds["high_ventilation"]
-        notes.append("AI predicts CO₂ may exceed the warning threshold → ventilation increased proactively.")
-
-    if predicted_co2 > thresholds["co2_crit"]:
-        actions["ventilation"] = 100
-        actions["outside_air_intake"] = 100
-        notes.append("AI predicts critical CO₂ → maximum ventilation selected.")
-
-    if predicted_temp > thresholds["temp_max"] and actions["cooling"] < 45:
-        actions["cooling"] = 45
-        actions["ventilation"] = max(actions["ventilation"], 45)
-        notes.append("AI predicts overheating → cooling activated proactively.")
-
-    if predicted_temp < thresholds["temp_min"] and actions["heating"] < 45:
-        actions["heating"] = 45
-        notes.append("AI predicts low temperature → heating activated proactively.")
-
-    if unsafe_probability >= 0.6:
-        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
-        actions["filtration"] = max(actions["filtration"], 80)
-        notes.append("AI predicts increased unsafe-state risk → preventive ventilation and filtration applied.")
-
-    if predicted_comfort < 60:
-        actions["ventilation"] = max(actions["ventilation"], thresholds["high_ventilation"])
-        notes.append("AI predicts low comfort score → preventive control action applied.")
-
-    for key in ["ventilation", "outside_air_intake", "filtration", "heating", "cooling", "lighting"]:
-        actions[key] = float(np.clip(actions[key], 0, 100))
-
-    actions["notes"] = notes
+    actions["notes"] = notes if notes else ["All indicators are within the target range."]
     return actions
 
-def classify_status(row: pd.Series, thresholds: dict, actions: dict):
-    co2 = float(get_value(row, "co2_ppm", 420))
-    temp = float(get_value(row, "indoor_temperature_c", 22))
-    humidity = float(get_value(row, "relative_humidity_percent", 45))
-    tvoc = float(get_value(row, "tvoc_ug_m3", 250))
-    co = float(get_value(row, "co_ppm", 0))
-    oxygen = float(get_value(row, "oxygen_percent", 20.9))
-    battery = float(get_value(row, "battery_percent", 100))
-    noise = float(get_value(row, "noise_dba", 40))
 
-    smoke = int(get_value(row, "smoke_detected", 0)) == 1
-    water_leak = int(get_value(row, "water_leak_detected", 0)) == 1
+def simulate_physical_response(state, inputs, actions):
+    """
+    This is the feedback-loop part:
+    actions are applied to the room, and the next indoor state is calculated.
+    """
+    next_state = state.copy()
 
-    critical = (
-        smoke
-        or co2 > thresholds["co2_crit"]
-        or tvoc > thresholds["tvoc_crit"]
-        or co > thresholds["co_crit"]
-        or oxygen < thresholds["oxygen_min"]
-        or battery < thresholds["battery_crit"]
+    # External inputs become measured metadata
+    for key, value in inputs.items():
+        if key in [
+            "space_mode",
+            "situation",
+            "occupancy",
+            "active_capacity",
+            "outside_temperature_c",
+            "daylight_lux",
+            "grid_available",
+            "backup_power_only",
+            "ventilation_fault",
+            "smoke_detected",
+            "water_leak_detected",
+        ]:
+            next_state[key] = value
+
+    people = inputs["occupancy"]
+    ventilation = actions["ventilation"]
+    filtration = actions["filtration"]
+    cooling = actions["cooling"]
+    heating = actions["heating"]
+
+    # CO2 dynamics
+    co2_generation = people * 1.25
+    co2_removal = (ventilation / 100) * (state["co2_ppm"] - 420) * 0.28
+    next_state["co2_ppm"] = clamp(state["co2_ppm"] + co2_generation - co2_removal, 420, 5000)
+
+    # Temperature dynamics
+    people_heat = people * 0.006
+    outside_exchange = (ventilation / 100) * (inputs["outside_temperature_c"] - state["indoor_temperature_c"]) * 0.05
+    hvac_effect = (heating / 100) * 1.0 - (cooling / 100) * 1.2
+    next_state["indoor_temperature_c"] = clamp(
+        state["indoor_temperature_c"] + people_heat + outside_exchange + hvac_effect + inputs["event_heat"],
+        10,
+        35,
     )
 
-    warning = (
-        co2 > thresholds["co2_warn"]
-        or temp < thresholds["temp_min"]
-        or temp > thresholds["temp_max"]
-        or humidity < thresholds["humidity_min"]
-        or humidity > thresholds["humidity_max"]
-        or tvoc > thresholds["tvoc_warn"]
-        or noise > thresholds["noise_warn"]
-        or water_leak
-        or actions["occupancy_ratio"] > 0.85
+    # Humidity dynamics
+    humidity_generation = people * 0.015
+    humidity_exchange = (ventilation / 100) * (inputs["outside_humidity_percent"] - state["relative_humidity_percent"]) * 0.04
+    next_state["relative_humidity_percent"] = clamp(
+        state["relative_humidity_percent"] + humidity_generation + humidity_exchange,
+        20,
+        90,
     )
 
-    if critical:
-        return "Critical", "#F44336"
-    if warning:
-        return "Warning", "#FFC107"
-    return "Optimal", "#4CAF50"
+    # Pollution dynamics
+    next_state["pm10_ug_m3"] = clamp(
+        state["pm10_ug_m3"] + people * 0.02 + inputs["event_pm10"] - (filtration / 100) * state["pm10_ug_m3"] * 0.18,
+        2,
+        200,
+    )
+
+    next_state["tvoc_ug_m3"] = clamp(
+        state["tvoc_ug_m3"] + people * 0.45 + inputs["event_tvoc"] - (filtration / 100) * state["tvoc_ug_m3"] * 0.12 - (ventilation / 100) * state["tvoc_ug_m3"] * 0.04,
+        50,
+        2500,
+    )
+
+    next_state["formaldehyde_ug_m3"] = clamp(
+        state["formaldehyde_ug_m3"] + people * 0.01 - (filtration / 100) * state["formaldehyde_ug_m3"] * 0.05,
+        3,
+        200,
+    )
+
+    # CO and oxygen
+    next_state["co_ppm"] = clamp(state["co_ppm"] * (1 - ventilation / 100 * 0.18), 0, 50)
+    oxygen_drop = people * 0.0008
+    oxygen_restore = (ventilation / 100) * (20.9 - state["oxygen_percent"]) * 0.35
+    next_state["oxygen_percent"] = clamp(state["oxygen_percent"] - oxygen_drop + oxygen_restore, 18.5, 21.0)
+
+    # Noise and light
+    base_noise = 35 + people * 0.12 + inputs["event_noise"]
+    next_state["noise_dba"] = clamp(base_noise, 30, 90)
+    next_state["indoor_light_lux"] = clamp(inputs["daylight_lux"] + actions["lighting"] * 6.5, 0, 1200)
+
+    # Energy and battery
+    energy_use = (
+        0.6
+        + actions["ventilation"] * 0.015
+        + actions["filtration"] * 0.010
+        + actions["heating"] * 0.025
+        + actions["cooling"] * 0.030
+        + actions["lighting"] * 0.006
+        + actions["emergency_lights"] * 0.004
+    )
+    next_state["energy_use_kw"] = round(energy_use, 2)
+
+    if inputs["grid_available"]:
+        next_state["battery_percent"] = clamp(state["battery_percent"] + 0.25, 0, 100)
+    else:
+        drain = 0.10 + energy_use * 0.18
+        next_state["battery_percent"] = clamp(state["battery_percent"] - drain, 0, 100)
+
+    thresholds = get_thresholds(inputs["space_mode"])
+    next_state["comfort_score"] = compute_comfort_score(next_state, thresholds)
+
+    return next_state
+
+
+def forecast_state(state, inputs, actions, steps):
+    predicted = state.copy()
+    for _ in range(steps):
+        predicted = simulate_physical_response(predicted, inputs, actions)
+    return predicted
 
 
 # ============================================================
-# VISUAL HELPERS
+# SESSION STATE
 # ============================================================
 
-def pct_bar(label: str, value: float, caption: str = ""):
-    value = float(np.clip(value, 0, 100))
-    st.write(f"**{label}: {value:.0f}%**")
-    st.progress(int(value))
-    if caption:
-        st.caption(caption)
+def reset_simulation(simulation_mode):
+    st.session_state.state = initial_state(simulation_mode)
+    st.session_state.history = []
+    st.session_state.last_simulation_mode = simulation_mode
 
 
-def status_badge(text: str, color: str):
-    st.markdown(
-        f"""
-        <div style="
-            padding: 0.6rem 0.9rem;
-            border-radius: 0.7rem;
-            background-color: {color}33;
-            border: 1px solid {color};
-            color: {color};
-            font-weight: 700;
-            text-align: center;">
-            {text}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("Simulation controls")
+
+simulation_mode = st.sidebar.radio(
+    "Simulation mode",
+    ["Coworking only", "Shelter only", "Full transition"],
+    index=2,
+)
+
+speed = st.sidebar.slider("State update speed, seconds", 0.2, 3.0, 0.8)
+auto_run = st.sidebar.toggle("Run simulation", value=True)
+
+if "state" not in st.session_state or st.session_state.get("last_simulation_mode") != simulation_mode:
+    reset_simulation(simulation_mode)
+
+if st.sidebar.button("Restart simulation"):
+    reset_simulation(simulation_mode)
+    st.rerun()
+
+if st.sidebar.button("Next state"):
+    st.session_state.manual_next = True
 
 
-def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: str):
-    occupancy = int(get_value(row, "occupancy", 0))
-    mode = str(get_value(row, "mode", "coworking"))
-    scenario = str(get_value(row, "planned_scenario", "normal"))
+# ============================================================
+# CURRENT LOOP CALCULATION
+# ============================================================
 
+state = st.session_state.state.copy()
+step = int(state["step"])
+inputs = scenario_inputs(simulation_mode, step)
+
+# Current measured metadata
+state["space_mode"] = inputs["space_mode"]
+state["situation"] = inputs["situation"]
+state["occupancy"] = inputs["occupancy"]
+state["active_capacity"] = inputs["active_capacity"]
+state["outside_temperature_c"] = inputs["outside_temperature_c"]
+state["daylight_lux"] = inputs["daylight_lux"]
+state["grid_available"] = inputs["grid_available"]
+state["backup_power_only"] = inputs["backup_power_only"]
+state["ventilation_fault"] = inputs["ventilation_fault"]
+state["smoke_detected"] = inputs["smoke_detected"]
+state["water_leak_detected"] = inputs["water_leak_detected"]
+
+thresholds = get_thresholds(inputs["space_mode"])
+status, status_color = status_color_from_state(state, thresholds)
+
+# 1) Prediction without new intervention
+no_action = baseline_actions(inputs["space_mode"])
+forecast_no_action = forecast_state(state, inputs, no_action, HORIZON_STEPS)
+
+# 2) Controller decides actions using current state + forecast
+actions = decide_actions(state, inputs, forecast_no_action)
+
+# 3) Predicted result after digital twin action
+forecast_after_action = forecast_state(state, inputs, actions, HORIZON_STEPS)
+
+# 4) Next physical state after one real step
+next_state = simulate_physical_response(state, inputs, actions)
+next_state["step"] = step + 1
+
+
+# ============================================================
+# MAIN DASHBOARD
+# ============================================================
+
+st.title("Adaptive Student Coworking Digital Twin")
+
+metric_cols = st.columns(8)
+
+with metric_cols[0]:
+    st.metric("Current situation", state["situation"])
+
+with metric_cols[1]:
+    st.metric("People", int(state["occupancy"]))
+
+with metric_cols[2]:
+    st.metric("Capacity use", f"{state['occupancy'] / max(state['active_capacity'], 1) * 100:.0f}%")
+
+with metric_cols[3]:
+    st.metric("CO₂", f"{state['co2_ppm']:.0f} ppm")
+
+with metric_cols[4]:
+    st.metric("Temperature", f"{state['indoor_temperature_c']:.1f} °C")
+
+with metric_cols[5]:
+    st.metric("Humidity", f"{state['relative_humidity_percent']:.0f}%")
+
+with metric_cols[6]:
+    st.metric("Battery", f"{state['battery_percent']:.0f}%")
+
+with metric_cols[7]:
+    st.metric("Comfort", f"{state['comfort_score']:.0f}/100")
+
+
+# ============================================================
+# ROOM VISUALIZATION
+# ============================================================
+
+def make_room_figure(state, actions, status_color):
     fig = go.Figure()
 
     fig.add_shape(
@@ -745,24 +733,21 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
         opacity=0.45,
     )
 
-    # People dots
-    dots = min(occupancy, 220)
+    dots = min(int(state["occupancy"]), 220)
     if dots > 0:
         rng = np.random.default_rng(42)
         x = rng.uniform(0.8, 11.2, dots)
-        y = rng.uniform(3.3, 6.4, dots)
+        y = rng.uniform(0.8, 6.2, dots)
         fig.add_trace(
             go.Scatter(
                 x=x,
                 y=y,
                 mode="markers",
                 marker=dict(size=7, color="black"),
-                name="People",
                 hovertemplate="Person<extra></extra>",
             )
         )
 
-    # Ventilation block
     vent_color = "#2196F3" if actions["ventilation"] > 0 else "#9E9E9E"
     fig.add_shape(
         type="rect",
@@ -777,16 +762,14 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
     fig.add_annotation(x=12.7, y=4.45, text="Vent", showarrow=False, font=dict(size=12))
 
     # Main door
-    door_open = int(get_value(row, "door_open", 0))
-    door_color = "#4CAF50" if door_open else "#795548"
     fig.add_shape(
         type="rect",
         x0=5.2,
         y0=-0.1,
         x1=6.8,
         y1=0.15,
-        line=dict(color=door_color, width=3),
-        fillcolor=door_color,
+        line=dict(color="#795548", width=3),
+        fillcolor="#795548",
     )
     fig.add_annotation(x=6, y=-0.35, text="Main door", showarrow=False, font=dict(size=11))
 
@@ -809,13 +792,12 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
         font=dict(size=11, color="#D32F2F"),
     )
 
-    title = f"{mode} | {scenario} | {status} | Ventilation {actions['ventilation']:.0f}% | Filtration {actions['filtration']:.0f}%"
-
+    title = f"{state['situation']} | Ventilation {actions['ventilation']:.0f}% | Cooling {actions['cooling']:.0f}%"
     fig.add_annotation(x=6, y=7.45, text=title, showarrow=False, font=dict(size=15))
 
     fig.update_layout(
         height=460,
-        xaxis=dict(visible=False, range=[-0.5, 13.4]),
+        xaxis=dict(visible=False, range=[-0.8, 13.4]),
         yaxis=dict(visible=False, range=[-0.6, 7.8]),
         margin=dict(l=10, r=10, t=50, b=10),
         showlegend=False,
@@ -824,196 +806,66 @@ def make_room_figure(row: pd.Series, actions: dict, status: str, status_color: s
     return fig
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("Dataset playback")
-
-default_path = find_default_dataset_path()
-uploaded_file = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"])
-
-if uploaded_file is not None:
-    dataset = load_dataset_from_upload(uploaded_file)
-    st.sidebar.success("Uploaded dataset is active.")
-elif default_path is not None:
-    dataset = load_dataset_from_path(str(default_path))
-    st.sidebar.success(f"Loaded: {default_path}")
-else:
-    st.error(
-        "Dataset not found. Put `coworking_shelter_sensor_dataset.csv` into the `data/` folder "
-        "or upload it through the sidebar."
-    )
-    st.stop()
-
-horizon_steps = st.sidebar.selectbox(
-    "AI prediction horizon",
-    options=[1, 2, 3, 6],
-    index=1,
-    format_func=lambda x: f"{x * 5} minutes ahead",
-)
-
-ai_models, ai_metrics = train_ai_models(dataset, horizon_steps=horizon_steps)
-
-if ai_models is not None:
-    st.session_state["ai_dummy_columns"] = ai_metrics["dummy_columns"]
-    st.session_state["ai_feature_columns"] = ai_metrics["feature_columns"]
-    st.session_state["ai_feature_mean"] = ai_metrics["feature_mean"]
-    st.session_state["ai_feature_std"] = ai_metrics["feature_std"]
-
-# Filters
-available_modes = sorted(dataset["mode"].dropna().unique().tolist())
-selected_modes = st.sidebar.multiselect(
-    "Modes",
-    available_modes,
-    default=available_modes,
-)
-
-filtered = dataset[dataset["mode"].isin(selected_modes)].copy()
-
-available_scenarios = sorted(filtered["planned_scenario"].dropna().unique().tolist())
-selected_scenarios = st.sidebar.multiselect(
-    "Scenarios",
-    available_scenarios,
-    default=available_scenarios,
-)
-
-filtered = filtered[filtered["planned_scenario"].isin(selected_scenarios)].reset_index(drop=True)
-
-if filtered.empty:
-    st.warning("No rows match the selected filters.")
-    st.stop()
-
-if "row_index" not in st.session_state:
-    st.session_state.row_index = 0
-
-if st.session_state.row_index >= len(filtered):
-    st.session_state.row_index = 0
-
-playback_mode = st.sidebar.radio(
-    "Playback mode",
-    ["Manual", "Auto"],
-    horizontal=True,
-)
-
-speed = st.sidebar.slider("Refresh speed, seconds", 0.2, 3.0, 0.8)
-
-st.session_state.row_index = st.sidebar.slider(
-    "Current dataset row",
-    0,
-    len(filtered) - 1,
-    int(st.session_state.row_index),
-)
-
-history_window = st.sidebar.slider("Chart window, rows", 20, 400, 120, step=20)
-
-if st.sidebar.button("Restart playback"):
-    st.session_state.row_index = 0
-    st.rerun()
-
-row = filtered.iloc[st.session_state.row_index]
-mode = str(get_value(row, "mode", "coworking"))
-thresholds = get_thresholds(mode)
-
-if ai_models is not None:
-    ai_prediction = predict_future_state(
-        row,
-        ai_models,
-        ai_metrics["numeric_features"],
-        ai_metrics["categorical_features"],
-    )
-else:
-    ai_prediction = {}
-
-rule_actions = decide_actions(row, thresholds)
-actions = apply_ai_assistance(rule_actions, ai_prediction, thresholds)
-status, status_color = classify_status(row, thresholds, actions)
-
-
-# ============================================================
-# MAIN DASHBOARD
-# ============================================================
-
-st.title("Adaptive Student Coworking Digital Twin")
-
-# Key metrics
-metric_cols = st.columns(8)
-
-with metric_cols[0]:
-    st.metric("Current situation", str(get_value(row, "planned_scenario", "normal")))
-
-with metric_cols[1]:
-    st.metric("People", int(get_value(row, "occupancy", 0)))
-
-with metric_cols[2]:
-    st.metric("Capacity use", f"{actions['occupancy_ratio'] * 100:.0f}%")
-
-with metric_cols[3]:
-    st.metric("CO₂", f"{get_value(row, 'co2_ppm', 0):.0f} ppm")
-
-with metric_cols[4]:
-    st.metric("Temperature", f"{get_value(row, 'indoor_temperature_c', 0):.1f} °C")
-
-with metric_cols[5]:
-    st.metric("Humidity", f"{get_value(row, 'relative_humidity_percent', 0):.0f}%")
-
-with metric_cols[6]:
-    st.metric("Battery", f"{get_value(row, 'battery_percent', 0):.0f}%")
-
-with metric_cols[7]:
-    st.metric("Comfort", f"{get_value(row, 'comfort_score', 0):.0f}/100")
-
-
-# ============================================================
-# ROOM + ACTIONS
-# ============================================================
-
-left, middle, right = st.columns([1.15, 0.85, 1])
+left, middle, right = st.columns([1.1, 0.9, 1])
 
 with left:
     st.subheader("Room state")
-    fig_room = make_room_figure(row, actions, status, status_color)
+    fig_room = make_room_figure(state, actions, status_color)
     st.plotly_chart(fig_room, width="stretch")
 
+
 with middle:
-    st.subheader("AI prediction")
+    st.subheader("Feedback loop forecast")
 
-    if ai_models is None:
-        st.warning(ai_metrics.get("error", "AI model could not be trained."))
-    else:
-        st.metric(
-            f"CO₂ in {horizon_steps * 5} min",
-            f"{ai_prediction['future_co2_ppm']:.0f} ppm",
-            delta=f"{ai_prediction['future_co2_ppm'] - float(get_value(row, 'co2_ppm', 0)):.0f} ppm",
-        )
-        st.metric(
-            f"Temperature in {horizon_steps * 5} min",
-            f"{ai_prediction['future_temperature_c']:.1f} °C",
-            delta=f"{ai_prediction['future_temperature_c'] - float(get_value(row, 'indoor_temperature_c', 0)):.1f} °C",
-        )
-        st.metric(
-            f"Comfort in {horizon_steps * 5} min",
-            f"{ai_prediction['future_comfort_score']:.0f}/100",
-            delta=f"{ai_prediction['future_comfort_score'] - float(get_value(row, 'comfort_score', 0)):.0f}",
-        )
-        st.metric("Unsafe risk", f"{ai_prediction['unsafe_probability'] * 100:.0f}%")
+    forecast_table = pd.DataFrame(
+        {
+            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
+            "Current state": [
+                f"{state['co2_ppm']:.0f} ppm",
+                f"{state['indoor_temperature_c']:.1f} °C",
+                f"{state['relative_humidity_percent']:.0f}%",
+                f"{state['tvoc_ug_m3']:.0f} μg/m³",
+                f"{state['battery_percent']:.0f}%",
+                f"{state['comfort_score']:.0f}/100",
+            ],
+            "In 10 min without action": [
+                f"{forecast_no_action['co2_ppm']:.0f} ppm",
+                f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
+                f"{forecast_no_action['relative_humidity_percent']:.0f}%",
+                f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
+                f"{forecast_no_action['battery_percent']:.0f}%",
+                f"{forecast_no_action['comfort_score']:.0f}/100",
+            ],
+            "In 10 min after action": [
+                f"{forecast_after_action['co2_ppm']:.0f} ppm",
+                f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
+                f"{forecast_after_action['relative_humidity_percent']:.0f}%",
+                f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
+                f"{forecast_after_action['battery_percent']:.0f}%",
+                f"{forecast_after_action['comfort_score']:.0f}/100",
+            ],
+        }
+    )
 
-        with st.expander("AI model quality"):
-            st.write(f"CO₂ MAE: **{ai_metrics['co2_mae']:.1f} ppm**")
-            st.write(f"Temperature MAE: **{ai_metrics['temperature_mae']:.2f} °C**")
-            st.write(f"Comfort score MAE: **{ai_metrics['comfort_mae']:.1f} points**")
-            st.write(f"Unsafe-state accuracy: **{ai_metrics['unsafe_accuracy'] * 100:.1f}%**")
-            st.caption(
-                "The model is trained on the currently loaded synthetic/historical sensor dataset. "
-                "It predicts the future state and helps the controller act proactively."
-            )
+    st.dataframe(forecast_table, width="stretch", hide_index=True)
+
+    st.caption(
+        "The system predicts what would happen without intervention, chooses control actions, "
+        "and then simulates the changed room state after those actions are applied."
+    )
 
 
 with right:
-    st.subheader("Recommended actions")
+    st.subheader("Automatic control actions")
 
-    pct_bar("Ventilation", actions["ventilation"], "Controls CO₂, humidity and heat removal.")
-    pct_bar("Outside air intake", actions["outside_air_intake"], "Follows the requested ventilation level.")
+    def pct_bar(label, value, caption=""):
+        st.write(f"**{label}: {value:.0f}%**")
+        st.progress(int(clamp(value, 0, 100)))
+        if caption:
+            st.caption(caption)
+
+    pct_bar("Ventilation", actions["ventilation"], "Controls CO₂ and humidity.")
+    pct_bar("Outside air intake", actions["outside_air_intake"])
     pct_bar("Air filtration", actions["filtration"], "Controls PM10, VOC and formaldehyde.")
     pct_bar("Heating", actions["heating"])
     pct_bar("Cooling", actions["cooling"])
@@ -1031,215 +883,92 @@ with right:
 
 
 # ============================================================
-# SENSOR TABLE + DECISION EXPLANATION
+# EXPLANATION
 # ============================================================
 
-tab_sensors, tab_explanation, tab_compare = st.tabs(
-    ["Sensor values", "Why did the system act?", "Dataset equipment state"]
-)
-
-with tab_sensors:
-    sensor_table = pd.DataFrame(
-        {
-            "Indicator": [
-                "CO₂",
-                "Temperature",
-                "Relative humidity",
-                "PM10",
-                "TVOC",
-                "Formaldehyde",
-                "Carbon monoxide",
-                "Oxygen",
-                "Noise",
-                "Indoor light",
-                "Daylight",
-                "Outdoor temperature",
-                "Area per person",
-                "Battery",
-                "Energy use",
-            ],
-            "Current value": [
-                f"{get_value(row, 'co2_ppm', 0):.0f} ppm",
-                f"{get_value(row, 'indoor_temperature_c', 0):.1f} °C",
-                f"{get_value(row, 'relative_humidity_percent', 0):.0f}%",
-                f"{get_value(row, 'pm10_ug_m3', 0):.1f} μg/m³",
-                f"{get_value(row, 'tvoc_ug_m3', 0):.0f} μg/m³",
-                f"{get_value(row, 'formaldehyde_ug_m3', 0):.1f} μg/m³",
-                f"{get_value(row, 'co_ppm', 0):.1f} ppm",
-                f"{get_value(row, 'oxygen_percent', 20.9):.2f}%",
-                f"{get_value(row, 'noise_dba', 0):.1f} dBA",
-                f"{get_value(row, 'indoor_light_lux', 0):.0f} lux",
-                f"{get_value(row, 'daylight_lux', 0):.0f} lux",
-                f"{get_value(row, 'outside_temperature_c', 0):.1f} °C",
-                "empty" if np.isinf(actions["area_per_person"]) else f"{actions['area_per_person']:.1f} m²/person",
-                f"{get_value(row, 'battery_percent', 0):.0f}%",
-                f"{get_value(row, 'energy_use_kw', 0):.2f} kW",
-            ],
-            "Target in current mode": [
-                f"< {thresholds['co2_warn']} ppm; critical > {thresholds['co2_crit']} ppm",
-                f"{thresholds['temp_min']}–{thresholds['temp_max']} °C",
-                f"{thresholds['humidity_min']}–{thresholds['humidity_max']}%",
-                f"< {thresholds['pm10_warn']} μg/m³",
-                f"< {thresholds['tvoc_warn']} μg/m³",
-                f"< {thresholds['hcho_warn']} μg/m³",
-                f"< {thresholds['co_warn']} ppm",
-                f"> {thresholds['oxygen_min']}%",
-                f"< {thresholds['noise_warn']} dBA",
-                f"≈ {thresholds['lux_target']} lux",
-                "Used for daylight harvesting",
-                "Used for heating/cooling decision",
-                "Coworking: 4–6 m²/person; shelter can be denser",
-                f"Warning < {thresholds['battery_warn']}%",
-                "Minimize without harming comfort/health",
-            ],
-        }
-    )
-
-    st.dataframe(sensor_table, width="stretch", hide_index=True)
-
-with tab_explanation:
-    st.write("**Decision logic explanation:**")
+with st.expander("Why did the system act?"):
     for note in actions["notes"]:
         st.write(f"- {note}")
 
-    trigger = get_value(row, "primary_trigger", "normal")
-    triggers = get_value(row, "triggers", "normal")
-    st.write("**Dataset labels:**")
-    st.write(f"- Primary trigger: `{trigger}`")
-    st.write(f"- Triggers: `{triggers}`")
-    st.write(f"- Comfort level: `{get_value(row, 'comfort_level', 'unknown')}`")
-    st.write(f"- Unsafe label: `{int(get_value(row, 'is_unsafe', 0))}`")
-
-with tab_compare:
-    comparison_rows = [
-        ("Ventilation", "ventilation_level_percent", actions["ventilation"]),
-        ("Outside air intake", "outside_air_intake_percent", actions["outside_air_intake"]),
-        ("Filtration", "filtration_level_percent", actions["filtration"]),
-        ("Heating", "heating_level_percent", actions["heating"]),
-        ("Cooling", "cooling_level_percent", actions["cooling"]),
-        ("Lighting", "lighting_level_percent", actions["lighting"]),
-    ]
-
-    comparison = []
-    for label, col, recommended in comparison_rows:
-        dataset_value = get_value(row, col, np.nan)
-        comparison.append(
-            {
-                "System": label,
-                "Dataset equipment state": "missing" if pd.isna(dataset_value) else f"{dataset_value:.0f}%",
-                "Digital twin recommendation": f"{recommended:.0f}%",
-            }
-        )
-
-    st.dataframe(pd.DataFrame(comparison), width="stretch", hide_index=True)
-
-    st.caption(
-        "Dataset equipment state can be interpreted as the recorded/current state of equipment. "
-        "Digital twin recommendation is calculated live from sensor values and AI forecast."
-    )
-
 
 # ============================================================
-# CHARTS
+# HISTORY UPDATE AND CHARTS
 # ============================================================
 
-st.subheader("Time-series playback")
+history_row = {
+    "step": step,
+    "situation": state["situation"],
+    "space_mode": state["space_mode"],
+    "occupancy": state["occupancy"],
+    "co2_ppm": state["co2_ppm"],
+    "temperature_c": state["indoor_temperature_c"],
+    "humidity_percent": state["relative_humidity_percent"],
+    "tvoc_ug_m3": state["tvoc_ug_m3"],
+    "battery_percent": state["battery_percent"],
+    "comfort_score": state["comfort_score"],
+    "ventilation": actions["ventilation"],
+    "filtration": actions["filtration"],
+    "heating": actions["heating"],
+    "cooling": actions["cooling"],
+    "lighting": actions["lighting"],
+    "forecast_co2_without_action": forecast_no_action["co2_ppm"],
+    "forecast_co2_after_action": forecast_after_action["co2_ppm"],
+    "forecast_temp_without_action": forecast_no_action["indoor_temperature_c"],
+    "forecast_temp_after_action": forecast_after_action["indoor_temperature_c"],
+}
 
-end = st.session_state.row_index + 1
-start = max(0, end - history_window)
-chart_df = filtered.iloc[start:end].copy()
+if not st.session_state.history or st.session_state.history[-1]["step"] != step:
+    st.session_state.history.append(history_row)
 
-if "timestamp" in chart_df.columns and chart_df["timestamp"].notna().any():
-    x_axis = chart_df["timestamp"]
-    x_title = "Time"
-else:
-    x_axis = chart_df.index
-    x_title = "Dataset row"
+history = pd.DataFrame(st.session_state.history).tail(160)
 
-tab_env, tab_air, tab_energy, tab_actions = st.tabs(
-    ["Environment", "Air quality", "Energy", "Actions"]
-)
+st.subheader("Closed-loop simulation history")
+
+tab_env, tab_actions = st.tabs(["Environment", "Actions"])
 
 with tab_env:
     fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=x_axis, y=chart_df["co2_ppm"], mode="lines", name="CO₂, ppm"))
-    fig.add_hline(y=thresholds["co2_warn"], line_dash="dash", annotation_text="CO₂ warning")
-    fig.add_hline(y=thresholds["co2_crit"], line_dash="dot", annotation_text="CO₂ critical")
-
-    fig.update_layout(height=350, xaxis_title=x_title, yaxis_title="CO₂, ppm")
+    fig.add_trace(go.Scatter(x=history["step"], y=history["co2_ppm"], mode="lines", name="Actual CO₂"))
+    fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
+    fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
+    fig.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="CO₂, ppm")
     st.plotly_chart(fig, width="stretch")
 
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=x_axis, y=chart_df["indoor_temperature_c"], mode="lines", name="Temperature, °C"))
-    fig2.add_hline(y=thresholds["temp_min"], line_dash="dash", annotation_text="Min target")
-    fig2.add_hline(y=thresholds["temp_max"], line_dash="dash", annotation_text="Max target")
-
-    fig2.update_layout(height=330, xaxis_title=x_title, yaxis_title="Temperature, °C")
+    fig2.add_trace(go.Scatter(x=history["step"], y=history["temperature_c"], mode="lines", name="Actual temperature"))
+    fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
+    fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
+    fig2.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Temperature, °C")
     st.plotly_chart(fig2, width="stretch")
 
-with tab_air:
-    fig = go.Figure()
-
-    for col, name in [
-        ("pm10_ug_m3", "PM10"),
-        ("tvoc_ug_m3", "TVOC"),
-        ("formaldehyde_ug_m3", "Formaldehyde"),
-    ]:
-        if col in chart_df.columns:
-            fig.add_trace(go.Scatter(x=x_axis, y=chart_df[col], mode="lines", name=name))
-
-    fig.update_layout(height=380, xaxis_title=x_title, yaxis_title="Pollutant value")
-    st.plotly_chart(fig, width="stretch")
-
-with tab_energy:
-    fig = go.Figure()
-
-    if "battery_percent" in chart_df.columns:
-        fig.add_trace(go.Scatter(x=x_axis, y=chart_df["battery_percent"], mode="lines", name="Battery, %"))
-
-    if "energy_use_kw" in chart_df.columns:
-        fig.add_trace(go.Scatter(x=x_axis, y=chart_df["energy_use_kw"], mode="lines", name="Energy use, kW"))
-
-    fig.update_layout(height=360, xaxis_title=x_title, yaxis_title="Value")
-    st.plotly_chart(fig, width="stretch")
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(x=history["step"], y=history["comfort_score"], mode="lines", name="Comfort score"))
+    fig3.add_trace(go.Scatter(x=history["step"], y=history["battery_percent"], mode="lines", name="Battery"))
+    fig3.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Value")
+    st.plotly_chart(fig3, width="stretch")
 
 with tab_actions:
     fig = go.Figure()
+    for col, name in [
+        ("ventilation", "Ventilation"),
+        ("filtration", "Filtration"),
+        ("heating", "Heating"),
+        ("cooling", "Cooling"),
+        ("lighting", "Lighting"),
+    ]:
+        fig.add_trace(go.Scatter(x=history["step"], y=history[col], mode="lines", name=name))
 
-    action_columns = [
-        ("ventilation_level_percent", "Dataset ventilation"),
-        ("filtration_level_percent", "Dataset filtration"),
-        ("lighting_level_percent", "Dataset lighting"),
-        ("cooling_level_percent", "Dataset cooling"),
-        ("heating_level_percent", "Dataset heating"),
-    ]
-
-    for col, name in action_columns:
-        if col in chart_df.columns:
-            fig.add_trace(go.Scatter(x=x_axis, y=chart_df[col], mode="lines", name=name))
-
-    fig.update_layout(height=380, xaxis_title=x_title, yaxis_title="Equipment state, %")
+    fig.update_layout(height=380, xaxis_title="Simulation step", yaxis_title="Control level, %")
     st.plotly_chart(fig, width="stretch")
 
 
 # ============================================================
-# RAW ROW
+# APPLY NEXT STATE
 # ============================================================
 
-with st.expander("Show current dataset row"):
-    raw_row = pd.DataFrame({
-        "column": row.index.astype(str),
-        "value": [str(v) for v in row.values],
-    })
-    st.dataframe(raw_row, width="stretch", hide_index=True)
+should_advance = auto_run or st.session_state.pop("manual_next", False)
 
-
-# ============================================================
-# AUTO PLAYBACK
-# ============================================================
-
-if playback_mode == "Auto":
+if should_advance:
+    st.session_state.state = next_state
     time.sleep(speed)
-    st.session_state.row_index = (st.session_state.row_index + 1) % len(filtered)
     st.rerun()
