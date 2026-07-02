@@ -7,13 +7,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, mean_absolute_error
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 
 
 # ============================================================
@@ -200,7 +193,7 @@ def get_thresholds(mode: str) -> dict:
 
 
 # ============================================================
-# AI / ML PREDICTION MODULE
+# AI / ML PREDICTION MODULE WITHOUT EXTERNAL ML LIBRARIES
 # ============================================================
 
 NUMERIC_FEATURES = [
@@ -238,12 +231,6 @@ CATEGORICAL_FEATURES = [
     "ventilation_state",
 ]
 
-REGRESSION_TARGETS = [
-    "future_co2_ppm",
-    "future_temperature_c",
-    "future_comfort_score",
-]
-
 
 def get_existing_features(df: pd.DataFrame):
     numeric = [col for col in NUMERIC_FEATURES if col in df.columns]
@@ -251,13 +238,48 @@ def get_existing_features(df: pd.DataFrame):
     return numeric, categorical
 
 
+def build_feature_matrix(df: pd.DataFrame, numeric_features: list, categorical_features: list, dummy_columns=None):
+    """
+    Builds a numeric feature matrix using pandas/numpy only.
+    This avoids scikit-learn dependency on Streamlit Cloud.
+    """
+    parts = []
+
+    if numeric_features:
+        numeric_df = df[numeric_features].copy()
+        numeric_df = numeric_df.apply(pd.to_numeric, errors="coerce")
+        numeric_df = numeric_df.fillna(numeric_df.median(numeric_only=True))
+        numeric_df = numeric_df.fillna(0)
+        parts.append(numeric_df)
+
+    if categorical_features:
+        cat_df = df[categorical_features].copy().fillna("unknown").astype(str)
+        cat_dummies = pd.get_dummies(cat_df, columns=categorical_features, dtype=float)
+
+        if dummy_columns is not None:
+            cat_dummies = cat_dummies.reindex(columns=dummy_columns, fill_value=0)
+
+        parts.append(cat_dummies)
+
+    if not parts:
+        matrix_df = pd.DataFrame(index=df.index)
+    else:
+        matrix_df = pd.concat(parts, axis=1)
+
+    return matrix_df.astype(float)
+
+
 @st.cache_resource
 def train_ai_models(df: pd.DataFrame, horizon_steps: int = 2):
     """
-    Trains small ML models on the loaded sensor dataset.
+    Lightweight ML-style predictor trained on the loaded sensor dataset.
 
-    horizon_steps=2 means approximately 10 minutes ahead
-    if the dataset interval is 5 minutes.
+    It uses nearest-neighbor matching:
+    - finds past states similar to the current state;
+    - averages what happened after those states;
+    - returns a forecast for CO₂, temperature, comfort score and unsafe risk.
+
+    horizon_steps=2 means approximately 10 minutes ahead if the dataset interval is 5 minutes.
     """
     data = df.copy()
 
@@ -271,112 +293,151 @@ def train_ai_models(df: pd.DataFrame, horizon_steps: int = 2):
     data["future_comfort_score"] = data["comfort_score"].shift(-horizon_steps)
     data["future_is_unsafe"] = data["is_unsafe"].shift(-horizon_steps)
 
-    data = data.dropna(subset=REGRESSION_TARGETS + ["future_is_unsafe"]).reset_index(drop=True)
+    target_cols = [
+        "future_co2_ppm",
+        "future_temperature_c",
+        "future_comfort_score",
+        "future_is_unsafe",
+    ]
+
+    data = data.dropna(subset=target_cols).reset_index(drop=True)
 
     if len(data) < 100:
         return None, {"error": "Not enough rows to train the AI model."}
 
     numeric_features, categorical_features = get_existing_features(data)
+    feature_df = build_feature_matrix(data, numeric_features, categorical_features)
+    dummy_columns = [
+        col for col in feature_df.columns
+        if any(col.startswith(f"{cat}_") for cat in categorical_features)
+    ]
 
-    X = data[numeric_features + categorical_features]
-    y_reg = data[REGRESSION_TARGETS]
-    y_cls = data["future_is_unsafe"].astype(int)
+    feature_values = feature_df.to_numpy(dtype=float)
 
-    X_train, X_test, y_reg_train, y_reg_test, y_cls_train, y_cls_test = train_test_split(
-        X,
-        y_reg,
-        y_cls,
-        test_size=0.2,
-        shuffle=False,
-    )
+    split_idx = int(len(data) * 0.8)
+    split_idx = max(50, min(split_idx, len(data) - 20))
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", SimpleImputer(strategy="median"), numeric_features),
-            (
-                "cat",
-                Pipeline(
-                    steps=[
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
-                        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-                    ]
-                ),
-                categorical_features,
-            ),
-        ],
-        remainder="drop",
-    )
+    x_train = feature_values[:split_idx]
+    x_test = feature_values[split_idx:]
 
-    regressor = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            (
-                "model",
-                RandomForestRegressor(
-                    n_estimators=80,
-                    max_depth=12,
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
+    y_train = data[target_cols].iloc[:split_idx].to_numpy(dtype=float)
+    y_test = data[target_cols].iloc[split_idx:].to_numpy(dtype=float)
 
-    classifier = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=80,
-                    max_depth=12,
-                    random_state=42,
-                    n_jobs=-1,
-                    class_weight="balanced",
-                ),
-            ),
-        ]
-    )
+    feature_mean = np.nanmean(x_train, axis=0)
+    feature_std = np.nanstd(x_train, axis=0)
+    feature_std[feature_std == 0] = 1
 
-    regressor.fit(X_train, y_reg_train)
-    classifier.fit(X_train, y_cls_train)
+    x_train_scaled = (x_train - feature_mean) / feature_std
+    x_test_scaled = (x_test - feature_mean) / feature_std
 
-    reg_pred = regressor.predict(X_test)
-    cls_pred = classifier.predict(X_test)
+    # Limit stored rows to keep Streamlit Cloud fast
+    max_train_rows = 8000
+    if len(x_train_scaled) > max_train_rows:
+        rng = np.random.default_rng(42)
+        keep_idx = rng.choice(len(x_train_scaled), size=max_train_rows, replace=False)
+        x_store = x_train_scaled[keep_idx]
+        y_store = y_train[keep_idx]
+    else:
+        x_store = x_train_scaled
+        y_store = y_train
+
+    def knn_predict_batch(x_batch, k=25):
+        predictions = []
+        for x in x_batch:
+            distances = np.mean((x_store - x) ** 2, axis=1)
+            nearest_idx = np.argpartition(distances, min(k, len(distances) - 1))[:k]
+            nearest_dist = distances[nearest_idx]
+            weights = 1 / (nearest_dist + 1e-6)
+            weights = weights / weights.sum()
+            predictions.append(np.sum(y_store[nearest_idx] * weights[:, None], axis=0))
+        return np.array(predictions)
+
+    # Evaluate on a sample to avoid heavy calculations
+    max_test_rows = 1000
+    if len(x_test_scaled) > max_test_rows:
+        eval_idx = np.linspace(0, len(x_test_scaled) - 1, max_test_rows).astype(int)
+        x_eval = x_test_scaled[eval_idx]
+        y_eval = y_test[eval_idx]
+    else:
+        x_eval = x_test_scaled
+        y_eval = y_test
+
+    pred_eval = knn_predict_batch(x_eval, k=25)
+
+    co2_mae = float(np.mean(np.abs(y_eval[:, 0] - pred_eval[:, 0])))
+    temperature_mae = float(np.mean(np.abs(y_eval[:, 1] - pred_eval[:, 1])))
+    comfort_mae = float(np.mean(np.abs(y_eval[:, 2] - pred_eval[:, 2])))
+    unsafe_pred = (pred_eval[:, 3] >= 0.5).astype(int)
+    unsafe_true = y_eval[:, 3].astype(int)
+    unsafe_accuracy = float(np.mean(unsafe_pred == unsafe_true))
 
     metrics = {
-        "co2_mae": float(mean_absolute_error(y_reg_test["future_co2_ppm"], reg_pred[:, 0])),
-        "temperature_mae": float(mean_absolute_error(y_reg_test["future_temperature_c"], reg_pred[:, 1])),
-        "comfort_mae": float(mean_absolute_error(y_reg_test["future_comfort_score"], reg_pred[:, 2])),
-        "unsafe_accuracy": float(accuracy_score(y_cls_test, cls_pred)),
+        "co2_mae": co2_mae,
+        "temperature_mae": temperature_mae,
+        "comfort_mae": comfort_mae,
+        "unsafe_accuracy": unsafe_accuracy,
         "numeric_features": numeric_features,
         "categorical_features": categorical_features,
+        "dummy_columns": dummy_columns,
+        "feature_columns": list(feature_df.columns),
+        "feature_mean": feature_mean,
+        "feature_std": feature_std,
     }
 
-    return {"regressor": regressor, "classifier": classifier}, metrics
+    model = {
+        "x_train_scaled": x_store,
+        "y_train": y_store,
+        "k": 25,
+    }
+
+    return model, metrics
 
 
 def predict_future_state(row: pd.Series, models: dict, numeric_features: list, categorical_features: list) -> dict:
     if models is None:
         return {}
 
-    X_current = pd.DataFrame([
+    current_df = pd.DataFrame([
         {col: get_value(row, col, np.nan) for col in numeric_features + categorical_features}
     ])
 
-    reg_prediction = models["regressor"].predict(X_current)[0]
-    unsafe_prediction = int(models["classifier"].predict(X_current)[0])
+    dummy_columns = st.session_state.get("ai_dummy_columns", None)
 
-    if hasattr(models["classifier"], "predict_proba"):
-        proba = models["classifier"].predict_proba(X_current)[0]
-        unsafe_probability = float(proba[1]) if len(proba) > 1 else float(unsafe_prediction)
-    else:
-        unsafe_probability = float(unsafe_prediction)
+    current_features = build_feature_matrix(
+        current_df,
+        numeric_features,
+        categorical_features,
+        dummy_columns=dummy_columns,
+    )
+
+    # Align to the exact feature columns used during training
+    feature_columns = st.session_state.get("ai_feature_columns", list(current_features.columns))
+    current_features = current_features.reindex(columns=feature_columns, fill_value=0)
+
+    x = current_features.to_numpy(dtype=float)
+    feature_mean = st.session_state["ai_feature_mean"]
+    feature_std = st.session_state["ai_feature_std"]
+    x_scaled = (x - feature_mean) / feature_std
+
+    x_train = models["x_train_scaled"]
+    y_train = models["y_train"]
+    k = min(models["k"], len(x_train))
+
+    distances = np.mean((x_train - x_scaled[0]) ** 2, axis=1)
+    nearest_idx = np.argpartition(distances, k - 1)[:k]
+    nearest_dist = distances[nearest_idx]
+    weights = 1 / (nearest_dist + 1e-6)
+    weights = weights / weights.sum()
+
+    prediction = np.sum(y_train[nearest_idx] * weights[:, None], axis=0)
+
+    unsafe_probability = float(np.clip(prediction[3], 0, 1))
+    unsafe_prediction = int(unsafe_probability >= 0.5)
 
     return {
-        "future_co2_ppm": float(reg_prediction[0]),
-        "future_temperature_c": float(reg_prediction[1]),
-        "future_comfort_score": float(reg_prediction[2]),
+        "future_co2_ppm": float(prediction[0]),
+        "future_temperature_c": float(prediction[1]),
+        "future_comfort_score": float(prediction[2]),
         "future_is_unsafe": unsafe_prediction,
         "unsafe_probability": unsafe_probability,
     }
@@ -794,6 +855,12 @@ horizon_steps = st.sidebar.selectbox(
 
 ai_models, ai_metrics = train_ai_models(dataset, horizon_steps=horizon_steps)
 
+if ai_models is not None:
+    st.session_state["ai_dummy_columns"] = ai_metrics["dummy_columns"]
+    st.session_state["ai_feature_columns"] = ai_metrics["feature_columns"]
+    st.session_state["ai_feature_mean"] = ai_metrics["feature_mean"]
+    st.session_state["ai_feature_std"] = ai_metrics["feature_std"]
+
 # Filters
 available_modes = sorted(dataset["mode"].dropna().unique().tolist())
 selected_modes = st.sidebar.multiselect(
@@ -906,7 +973,7 @@ left, middle, right = st.columns([1.15, 0.85, 1])
 with left:
     st.subheader("Room state")
     fig_room = make_room_figure(row, actions, status, status_color)
-    st.plotly_chart(fig_room, use_container_width=True)
+    st.plotly_chart(fig_room, width="stretch")
 
 with middle:
     st.subheader("AI prediction")
@@ -1028,7 +1095,7 @@ with tab_sensors:
         }
     )
 
-    st.dataframe(sensor_table, use_container_width=True, hide_index=True)
+    st.dataframe(sensor_table, width="stretch", hide_index=True)
 
 with tab_explanation:
     st.write("**Decision logic explanation:**")
@@ -1064,7 +1131,7 @@ with tab_compare:
             }
         )
 
-    st.dataframe(pd.DataFrame(comparison), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(comparison), width="stretch", hide_index=True)
 
     st.caption(
         "Dataset equipment state can be interpreted as the recorded/current state of equipment. "
@@ -1101,7 +1168,7 @@ with tab_env:
     fig.add_hline(y=thresholds["co2_crit"], line_dash="dot", annotation_text="CO₂ critical")
 
     fig.update_layout(height=350, xaxis_title=x_title, yaxis_title="CO₂, ppm")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=x_axis, y=chart_df["indoor_temperature_c"], mode="lines", name="Temperature, °C"))
@@ -1109,7 +1176,7 @@ with tab_env:
     fig2.add_hline(y=thresholds["temp_max"], line_dash="dash", annotation_text="Max target")
 
     fig2.update_layout(height=330, xaxis_title=x_title, yaxis_title="Temperature, °C")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 with tab_air:
     fig = go.Figure()
@@ -1123,7 +1190,7 @@ with tab_air:
             fig.add_trace(go.Scatter(x=x_axis, y=chart_df[col], mode="lines", name=name))
 
     fig.update_layout(height=380, xaxis_title=x_title, yaxis_title="Pollutant value")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with tab_energy:
     fig = go.Figure()
@@ -1135,7 +1202,7 @@ with tab_energy:
         fig.add_trace(go.Scatter(x=x_axis, y=chart_df["energy_use_kw"], mode="lines", name="Energy use, kW"))
 
     fig.update_layout(height=360, xaxis_title=x_title, yaxis_title="Value")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with tab_actions:
     fig = go.Figure()
@@ -1153,7 +1220,7 @@ with tab_actions:
             fig.add_trace(go.Scatter(x=x_axis, y=chart_df[col], mode="lines", name=name))
 
     fig.update_layout(height=380, xaxis_title=x_title, yaxis_title="Equipment state, %")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ============================================================
@@ -1161,7 +1228,11 @@ with tab_actions:
 # ============================================================
 
 with st.expander("Show current dataset row"):
-    st.dataframe(pd.DataFrame(row).rename(columns={row.name: "value"}), use_container_width=True)
+    raw_row = pd.DataFrame({
+        "column": row.index.astype(str),
+        "value": [str(v) for v in row.values],
+    })
+    st.dataframe(raw_row, width="stretch", hide_index=True)
 
 
 # ============================================================
