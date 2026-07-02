@@ -66,39 +66,116 @@ def status_color_from_state(state, thresholds):
     return "Optimal", "#4CAF50"
 
 
+def compute_ieq_metrics(state, thresholds):
+    """
+    IEQ comfort model inspired by the presentation:
+    comfort is treated as the inverse of predicted dissatisfaction.
+
+    The presentation frames the ideal indoor environment as comfortable,
+    healthy and productive with the fewest dissatisfied occupants. It also
+    separates thermal comfort, air quality and perceived indoor-environment
+    quality. In this demo, we approximate that idea with:
+    - thermal discomfort index, 0-3;
+    - air-quality dissatisfaction, 0-100%;
+    - humidity/crowding/energy penalties;
+    - final comfort score = 100 - predicted dissatisfied percent.
+    """
+
+    temp = float(state["indoor_temperature_c"])
+    humidity = float(state["relative_humidity_percent"])
+    co2 = float(state["co2_ppm"])
+    pm10 = float(state["pm10_ug_m3"])
+    tvoc = float(state["tvoc_ug_m3"])
+    hcho = float(state["formaldehyde_ug_m3"])
+    battery = float(state["battery_percent"])
+    occupancy_ratio = float(state["occupancy"]) / max(float(state["active_capacity"]), 1)
+
+    # 1) Thermal discomfort index, 0-3.
+    # Similar to the TPI / thermal discomfort curves in the presentation:
+    # near preferred temperature discomfort is low; far from it dissatisfaction rises.
+    preferred_temp = 22.5 if state.get("space_mode", "coworking") == "coworking" else 22.0
+    temp_deviation = abs(temp - preferred_temp)
+
+    if temp_deviation <= 0.5:
+        thermal_discomfort = 0.0
+    elif temp_deviation >= 4.0:
+        thermal_discomfort = 3.0
+    else:
+        thermal_discomfort = ((temp_deviation - 0.5) / 3.5) * 3.0
+
+    thermal_discomfort = clamp(thermal_discomfort, 0, 3)
+
+    # Convert 0-3 thermal discomfort to approximate % dissatisfied.
+    # Even near neutral, a small share of people can still be dissatisfied.
+    thermal_dissatisfied = clamp(5 + (thermal_discomfort / 3) * 65, 0, 85)
+
+    # 2) Air quality dissatisfaction.
+    # The presentation shows dissatisfaction increasing with air pollution concentration.
+    co2_dissatisfied = clamp((co2 - 700) / max(thresholds["co2_crit"] - 700, 1) * 75, 0, 90)
+    pm10_dissatisfied = clamp((pm10 - 10) / max(thresholds["pm10_warn"] * 2 - 10, 1) * 55, 0, 80)
+    tvoc_dissatisfied = clamp((tvoc - 200) / max(thresholds["tvoc_crit"] - 200, 1) * 75, 0, 90)
+    hcho_dissatisfied = clamp((hcho - 10) / max(thresholds["hcho_warn"] * 2 - 10, 1) * 50, 0, 75)
+
+    air_quality_dissatisfied = max(
+        co2_dissatisfied,
+        0.6 * tvoc_dissatisfied + 0.25 * pm10_dissatisfied + 0.15 * hcho_dissatisfied,
+    )
+
+    # 3) Humidity dissatisfaction.
+    if thresholds["humidity_min"] <= humidity <= thresholds["humidity_max"]:
+        humidity_dissatisfied = 5
+    elif humidity < thresholds["humidity_min"]:
+        humidity_dissatisfied = clamp(5 + (thresholds["humidity_min"] - humidity) * 1.5, 5, 70)
+    else:
+        humidity_dissatisfied = clamp(5 + (humidity - thresholds["humidity_max"]) * 1.5, 5, 70)
+
+    # 4) Crowding / shelter density dissatisfaction.
+    crowding_dissatisfied = 0
+    if occupancy_ratio > 0.70:
+        crowding_dissatisfied = clamp((occupancy_ratio - 0.70) / 0.40 * 45, 0, 65)
+
+    # 5) Battery penalty matters mostly in shelter mode because comfort is constrained by safety/autonomy.
+    battery_dissatisfied = 0
+    if battery < thresholds["battery_warn"]:
+        battery_dissatisfied = clamp((thresholds["battery_warn"] - battery) * 1.2, 0, 60)
+
+    # Weighting differs by mode.
+    # Coworking: thermal comfort and productivity matter more.
+    # Shelter: health/safety and air quality matter more.
+    if state.get("space_mode", "coworking") == "shelter":
+        dissatisfied_percent = (
+            0.25 * thermal_dissatisfied
+            + 0.45 * air_quality_dissatisfied
+            + 0.10 * humidity_dissatisfied
+            + 0.10 * crowding_dissatisfied
+            + 0.10 * battery_dissatisfied
+        )
+    else:
+        dissatisfied_percent = (
+            0.45 * thermal_dissatisfied
+            + 0.30 * air_quality_dissatisfied
+            + 0.10 * humidity_dissatisfied
+            + 0.10 * crowding_dissatisfied
+            + 0.05 * battery_dissatisfied
+        )
+
+    dissatisfied_percent = clamp(dissatisfied_percent, 0, 100)
+    comfort_score = clamp(100 - dissatisfied_percent, 0, 100)
+
+    return {
+        "comfort_score": comfort_score,
+        "dissatisfied_percent": dissatisfied_percent,
+        "thermal_discomfort": thermal_discomfort,
+        "thermal_dissatisfied": thermal_dissatisfied,
+        "air_quality_dissatisfied": air_quality_dissatisfied,
+        "humidity_dissatisfied": humidity_dissatisfied,
+        "crowding_dissatisfied": crowding_dissatisfied,
+        "battery_dissatisfied": battery_dissatisfied,
+    }
+
+
 def compute_comfort_score(state, thresholds):
-    score = 100.0
-
-    # CO2 penalty
-    if state["co2_ppm"] > thresholds["co2_warn"]:
-        score -= min(30, (state["co2_ppm"] - thresholds["co2_warn"]) / 35)
-
-    # Temperature penalty
-    if state["indoor_temperature_c"] < thresholds["temp_min"]:
-        score -= min(25, (thresholds["temp_min"] - state["indoor_temperature_c"]) * 6)
-    if state["indoor_temperature_c"] > thresholds["temp_max"]:
-        score -= min(25, (state["indoor_temperature_c"] - thresholds["temp_max"]) * 6)
-
-    # Humidity penalty
-    if state["relative_humidity_percent"] < thresholds["humidity_min"]:
-        score -= min(15, (thresholds["humidity_min"] - state["relative_humidity_percent"]) * 0.7)
-    if state["relative_humidity_percent"] > thresholds["humidity_max"]:
-        score -= min(15, (state["relative_humidity_percent"] - thresholds["humidity_max"]) * 0.7)
-
-    # Pollution / safety / crowding
-    if state["pm10_ug_m3"] > thresholds["pm10_warn"]:
-        score -= min(15, (state["pm10_ug_m3"] - thresholds["pm10_warn"]) * 0.25)
-    if state["tvoc_ug_m3"] > thresholds["tvoc_warn"]:
-        score -= min(20, (state["tvoc_ug_m3"] - thresholds["tvoc_warn"]) * 0.025)
-
-    occupancy_ratio = state["occupancy"] / max(state["active_capacity"], 1)
-    if occupancy_ratio > 0.85:
-        score -= min(15, (occupancy_ratio - 0.85) * 60)
-
-    if state["battery_percent"] < thresholds["battery_warn"]:
-        score -= min(10, (thresholds["battery_warn"] - state["battery_percent"]) * 0.4)
-
-    return clamp(score, 0, 100)
+    return compute_ieq_metrics(state, thresholds)["comfort_score"]
 
 
 # ============================================================
@@ -366,7 +443,8 @@ def initial_state(simulation_mode):
         "water_leak_detected": False,
     }
 
-    state["comfort_score"] = compute_comfort_score(state, thresholds)
+    ieq = compute_ieq_metrics(state, thresholds)
+    state.update(ieq)
     return state
 
 
@@ -594,7 +672,8 @@ def simulate_physical_response(state, inputs, actions):
         next_state["battery_percent"] = clamp(state["battery_percent"] - drain, 0, 100)
 
     thresholds = get_thresholds(inputs["space_mode"])
-    next_state["comfort_score"] = compute_comfort_score(next_state, thresholds)
+    ieq = compute_ieq_metrics(next_state, thresholds)
+    next_state.update(ieq)
 
     return next_state
 
@@ -630,6 +709,7 @@ simulation_mode = st.sidebar.radio(
 
 speed = st.sidebar.slider("State update speed, seconds", 0.5, 3.0, 1.0)
 auto_run = st.sidebar.toggle("Run simulation", value=True)
+st.sidebar.caption("Only the simulation frame updates automatically, so charts should flicker less.")
 
 if "state" not in st.session_state or st.session_state.get("last_simulation_mode") != simulation_mode:
     reset_simulation(simulation_mode)
@@ -765,7 +845,7 @@ def render_simulation_frame():
 
     st.subheader("1. Sensor input: current measured room state")
 
-    sensor_cols = st.columns(6)
+    sensor_cols = st.columns(7)
 
     with sensor_cols[0]:
         st.metric("People", int(state["occupancy"]))
@@ -785,6 +865,9 @@ def render_simulation_frame():
     with sensor_cols[5]:
         st.metric("Comfort", f"{state['comfort_score']:.0f}/100")
 
+    with sensor_cols[6]:
+        st.metric("Dissatisfied", f"{state.get('dissatisfied_percent', 100 - state['comfort_score']):.0f}%")
+
 
     # ============================================================
     # STEPS 2–4 — CLOSED LOOP TABLE
@@ -794,7 +877,7 @@ def render_simulation_frame():
 
     closed_loop_table = pd.DataFrame(
         {
-            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
+            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort", "Dissatisfied", "Thermal discomfort"],
             "1. Current sensor state": [
                 f"{state['co2_ppm']:.0f} ppm",
                 f"{state['indoor_temperature_c']:.1f} °C",
@@ -802,6 +885,8 @@ def render_simulation_frame():
                 f"{state['tvoc_ug_m3']:.0f} μg/m³",
                 f"{state['battery_percent']:.0f}%",
                 f"{state['comfort_score']:.0f}/100",
+                f"{state.get('dissatisfied_percent', 100 - state['comfort_score']):.0f}%",
+                f"{state.get('thermal_discomfort', 0):.1f}/3",
             ],
             "2. Predicted in 10 min without action": [
                 f"{forecast_no_action['co2_ppm']:.0f} ppm",
@@ -810,6 +895,8 @@ def render_simulation_frame():
                 f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
                 f"{forecast_no_action['battery_percent']:.0f}%",
                 f"{forecast_no_action['comfort_score']:.0f}/100",
+                f"{forecast_no_action.get('dissatisfied_percent', 100 - forecast_no_action['comfort_score']):.0f}%",
+                f"{forecast_no_action.get('thermal_discomfort', 0):.1f}/3",
             ],
             "4. Predicted in 10 min after action": [
                 f"{forecast_after_action['co2_ppm']:.0f} ppm",
@@ -818,6 +905,8 @@ def render_simulation_frame():
                 f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
                 f"{forecast_after_action['battery_percent']:.0f}%",
                 f"{forecast_after_action['comfort_score']:.0f}/100",
+                f"{forecast_after_action.get('dissatisfied_percent', 100 - forecast_after_action['comfort_score']):.0f}%",
+                f"{forecast_after_action.get('thermal_discomfort', 0):.1f}/3",
             ],
         }
     )
@@ -989,6 +1078,9 @@ def render_simulation_frame():
         "tvoc_ug_m3": state["tvoc_ug_m3"],
         "battery_percent": state["battery_percent"],
         "comfort_score": state["comfort_score"],
+        "dissatisfied_percent": state.get("dissatisfied_percent", 100 - state["comfort_score"]),
+        "thermal_discomfort": state.get("thermal_discomfort", 0),
+        "air_quality_dissatisfied": state.get("air_quality_dissatisfied", 0),
         "ventilation": actions["ventilation"],
         "filtration": actions["filtration"],
         "heating": actions["heating"],
