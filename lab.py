@@ -1,5 +1,4 @@
 
-import time
 from pathlib import Path
 
 import numpy as np
@@ -629,8 +628,9 @@ simulation_mode = st.sidebar.radio(
     index=2,
 )
 
-speed = st.sidebar.slider("State update speed, seconds", 0.2, 3.0, 0.8)
+speed = st.sidebar.slider("State update speed, seconds", 0.5, 3.0, 1.0)
 auto_run = st.sidebar.toggle("Run simulation", value=True)
+st.sidebar.caption("Only the simulation frame updates automatically, so charts should flicker less.")
 
 if "state" not in st.session_state or st.session_state.get("last_simulation_mode") != simulation_mode:
     reset_simulation(simulation_mode)
@@ -643,365 +643,413 @@ if st.sidebar.button("Next state"):
     st.session_state.manual_next = True
 
 
-# ============================================================
-# CURRENT LOOP CALCULATION
-# ============================================================
-
-state = st.session_state.state.copy()
-step = int(state["step"])
-inputs = scenario_inputs(simulation_mode, step)
-
-# Current measured metadata
-state["space_mode"] = inputs["space_mode"]
-state["situation"] = inputs["situation"]
-state["occupancy"] = inputs["occupancy"]
-state["active_capacity"] = inputs["active_capacity"]
-state["outside_temperature_c"] = inputs["outside_temperature_c"]
-state["daylight_lux"] = inputs["daylight_lux"]
-state["grid_available"] = inputs["grid_available"]
-state["backup_power_only"] = inputs["backup_power_only"]
-state["ventilation_fault"] = inputs["ventilation_fault"]
-state["smoke_detected"] = inputs["smoke_detected"]
-state["water_leak_detected"] = inputs["water_leak_detected"]
-
-thresholds = get_thresholds(inputs["space_mode"])
-status, status_color = status_color_from_state(state, thresholds)
-
-# 1) Prediction without new intervention
-no_action = baseline_actions(inputs["space_mode"])
-forecast_no_action = forecast_state(state, inputs, no_action, HORIZON_STEPS)
-
-# 2) Controller decides actions using current state + forecast
-actions = decide_actions(state, inputs, forecast_no_action)
-
-# 3) Predicted result after digital twin action
-forecast_after_action = forecast_state(state, inputs, actions, HORIZON_STEPS)
-
-# 4) Next physical state after one real step
-next_state = simulate_physical_response(state, inputs, actions)
-next_state["step"] = step + 1
-
 
 # ============================================================
-# MAIN DASHBOARD
+# LOOP CALCULATION HELPER
 # ============================================================
 
-st.title("Adaptive Student Coworking Digital Twin")
+def calculate_loop_outputs(current_state, simulation_mode):
+    state = current_state.copy()
+    step = int(state["step"])
+    inputs = scenario_inputs(simulation_mode, step)
 
-mode_label = "Shelter" if state["space_mode"] == "shelter" else "Coworking"
+    # Current measured metadata
+    state["space_mode"] = inputs["space_mode"]
+    state["situation"] = inputs["situation"]
+    state["occupancy"] = inputs["occupancy"]
+    state["active_capacity"] = inputs["active_capacity"]
+    state["outside_temperature_c"] = inputs["outside_temperature_c"]
+    state["daylight_lux"] = inputs["daylight_lux"]
+    state["grid_available"] = inputs["grid_available"]
+    state["backup_power_only"] = inputs["backup_power_only"]
+    state["ventilation_fault"] = inputs["ventilation_fault"]
+    state["smoke_detected"] = inputs["smoke_detected"]
+    state["water_leak_detected"] = inputs["water_leak_detected"]
 
-st.markdown(
-    f"""
-    <div style="
-        padding: 1rem 1.2rem;
-        border-radius: 0.8rem;
-        border: 1px solid rgba(255,255,255,0.15);
-        background: rgba(255,255,255,0.04);
-        margin-bottom: 1rem;">
-        <div style="font-size: 0.9rem; opacity: 0.75;">Current simulation step</div>
-        <div style="font-size: 1.6rem; font-weight: 800;">{state['situation']}</div>
-        <div style="font-size: 1rem; opacity: 0.85;">
-            Space mode: <b>{mode_label}</b> · Step: <b>{step}</b> · 
-            The loop is: sensors → forecast → control action → changed room state → next sensor state.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    thresholds = get_thresholds(inputs["space_mode"])
+    status, status_color = status_color_from_state(state, thresholds)
 
-# ============================================================
-# STEP 1 — CURRENT SENSOR INPUT
-# ============================================================
+    # 1) Prediction without new intervention
+    no_action = baseline_actions(inputs["space_mode"])
+    forecast_no_action = forecast_state(state, inputs, no_action, HORIZON_STEPS)
 
-st.subheader("1. Sensor input: current measured room state")
+    # 2) Controller decides actions using current state + forecast
+    actions = decide_actions(state, inputs, forecast_no_action)
 
-sensor_cols = st.columns(6)
+    # 3) Predicted result after digital twin action
+    forecast_after_action = forecast_state(state, inputs, actions, HORIZON_STEPS)
 
-with sensor_cols[0]:
-    st.metric("People", int(state["occupancy"]))
-
-with sensor_cols[1]:
-    st.metric("Capacity use", f"{state['occupancy'] / max(state['active_capacity'], 1) * 100:.0f}%")
-
-with sensor_cols[2]:
-    st.metric("CO₂", f"{state['co2_ppm']:.0f} ppm")
-
-with sensor_cols[3]:
-    st.metric("Temperature", f"{state['indoor_temperature_c']:.1f} °C")
-
-with sensor_cols[4]:
-    st.metric("Humidity", f"{state['relative_humidity_percent']:.0f}%")
-
-with sensor_cols[5]:
-    st.metric("Comfort", f"{state['comfort_score']:.0f}/100")
+    # 4) Next physical state after one real step
+    next_state = simulate_physical_response(state, inputs, actions)
+    next_state["step"] = step + 1
 
 
-# ============================================================
-# STEPS 2–4 — CLOSED LOOP TABLE
-# ============================================================
 
-st.subheader("2–4. Forecast, decision and simulated result")
-
-closed_loop_table = pd.DataFrame(
-    {
-        "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
-        "1. Current sensor state": [
-            f"{state['co2_ppm']:.0f} ppm",
-            f"{state['indoor_temperature_c']:.1f} °C",
-            f"{state['relative_humidity_percent']:.0f}%",
-            f"{state['tvoc_ug_m3']:.0f} μg/m³",
-            f"{state['battery_percent']:.0f}%",
-            f"{state['comfort_score']:.0f}/100",
-        ],
-        "2. Predicted in 10 min without action": [
-            f"{forecast_no_action['co2_ppm']:.0f} ppm",
-            f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
-            f"{forecast_no_action['relative_humidity_percent']:.0f}%",
-            f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
-            f"{forecast_no_action['battery_percent']:.0f}%",
-            f"{forecast_no_action['comfort_score']:.0f}/100",
-        ],
-        "4. Predicted in 10 min after action": [
-            f"{forecast_after_action['co2_ppm']:.0f} ppm",
-            f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
-            f"{forecast_after_action['relative_humidity_percent']:.0f}%",
-            f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
-            f"{forecast_after_action['battery_percent']:.0f}%",
-            f"{forecast_after_action['comfort_score']:.0f}/100",
-        ],
+    return {
+        "state": state,
+        "step": step,
+        "inputs": inputs,
+        "thresholds": thresholds,
+        "status": status,
+        "status_color": status_color,
+        "forecast_no_action": forecast_no_action,
+        "actions": actions,
+        "forecast_after_action": forecast_after_action,
+        "next_state": next_state,
     }
-)
 
-st.dataframe(closed_loop_table, width="stretch", hide_index=True)
 
-st.caption(
-    "Column 2 shows what the system expects if it does nothing. "
-    "Column 4 shows the expected state after the digital twin applies the selected control actions."
-)
+if st.session_state.pop("manual_next", False):
+    manual_outputs = calculate_loop_outputs(st.session_state.state, simulation_mode)
+    st.session_state.state = manual_outputs["next_state"]
 
 
 # ============================================================
-# ROOM VISUALIZATION
+# FRAGMENTED UI
 # ============================================================
 
-def make_room_figure(state, actions, status_color):
-    fig = go.Figure()
+run_every_value = f"{speed}s" if auto_run else None
 
-    fig.add_shape(
-        type="rect",
-        x0=0,
-        y0=0,
-        x1=12,
-        y1=7,
-        line=dict(color="black", width=3),
-        fillcolor=status_color,
-        opacity=0.45,
+if hasattr(st, "fragment"):
+    def simulation_fragment(func):
+        return st.fragment(run_every=run_every_value)(func)
+else:
+    def simulation_fragment(func):
+        return func
+
+
+@simulation_fragment
+def render_simulation_frame():
+    outputs = calculate_loop_outputs(st.session_state.state, simulation_mode)
+
+    state = outputs["state"]
+    step = outputs["step"]
+    inputs = outputs["inputs"]
+    thresholds = outputs["thresholds"]
+    status = outputs["status"]
+    status_color = outputs["status_color"]
+    forecast_no_action = outputs["forecast_no_action"]
+    actions = outputs["actions"]
+    forecast_after_action = outputs["forecast_after_action"]
+    next_state = outputs["next_state"]
+
+    # ============================================================
+    # MAIN DASHBOARD
+    # ============================================================
+
+    st.title("Adaptive Student Coworking Digital Twin")
+
+    mode_label = "Shelter" if state["space_mode"] == "shelter" else "Coworking"
+
+    st.markdown(
+        f"""
+        <div style="
+            padding: 1rem 1.2rem;
+            border-radius: 0.8rem;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.04);
+            margin-bottom: 1rem;">
+            <div style="font-size: 0.9rem; opacity: 0.75;">Current simulation step</div>
+            <div style="font-size: 1.6rem; font-weight: 800;">{state['situation']}</div>
+            <div style="font-size: 1rem; opacity: 0.85;">
+                Space mode: <b>{mode_label}</b> · Step: <b>{step}</b> · 
+                The loop is: sensors → forecast → control action → changed room state → next sensor state.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    dots = min(int(state["occupancy"]), 220)
-    if dots > 0:
-        rng = np.random.default_rng(42)
-        x = rng.uniform(0.8, 11.2, dots)
-        y = rng.uniform(0.8, 6.2, dots)
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=y,
-                mode="markers",
-                marker=dict(size=7, color="black"),
-                hovertemplate="Person<extra></extra>",
-            )
+    # ============================================================
+    # STEP 1 — CURRENT SENSOR INPUT
+    # ============================================================
+
+    st.subheader("1. Sensor input: current measured room state")
+
+    sensor_cols = st.columns(6)
+
+    with sensor_cols[0]:
+        st.metric("People", int(state["occupancy"]))
+
+    with sensor_cols[1]:
+        st.metric("Capacity use", f"{state['occupancy'] / max(state['active_capacity'], 1) * 100:.0f}%")
+
+    with sensor_cols[2]:
+        st.metric("CO₂", f"{state['co2_ppm']:.0f} ppm")
+
+    with sensor_cols[3]:
+        st.metric("Temperature", f"{state['indoor_temperature_c']:.1f} °C")
+
+    with sensor_cols[4]:
+        st.metric("Humidity", f"{state['relative_humidity_percent']:.0f}%")
+
+    with sensor_cols[5]:
+        st.metric("Comfort", f"{state['comfort_score']:.0f}/100")
+
+
+    # ============================================================
+    # STEPS 2–4 — CLOSED LOOP TABLE
+    # ============================================================
+
+    st.subheader("2–4. Forecast, decision and simulated result")
+
+    closed_loop_table = pd.DataFrame(
+        {
+            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
+            "1. Current sensor state": [
+                f"{state['co2_ppm']:.0f} ppm",
+                f"{state['indoor_temperature_c']:.1f} °C",
+                f"{state['relative_humidity_percent']:.0f}%",
+                f"{state['tvoc_ug_m3']:.0f} μg/m³",
+                f"{state['battery_percent']:.0f}%",
+                f"{state['comfort_score']:.0f}/100",
+            ],
+            "2. Predicted in 10 min without action": [
+                f"{forecast_no_action['co2_ppm']:.0f} ppm",
+                f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
+                f"{forecast_no_action['relative_humidity_percent']:.0f}%",
+                f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
+                f"{forecast_no_action['battery_percent']:.0f}%",
+                f"{forecast_no_action['comfort_score']:.0f}/100",
+            ],
+            "4. Predicted in 10 min after action": [
+                f"{forecast_after_action['co2_ppm']:.0f} ppm",
+                f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
+                f"{forecast_after_action['relative_humidity_percent']:.0f}%",
+                f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
+                f"{forecast_after_action['battery_percent']:.0f}%",
+                f"{forecast_after_action['comfort_score']:.0f}/100",
+            ],
+        }
+    )
+
+    st.dataframe(closed_loop_table, width="stretch", hide_index=True)
+
+    st.caption(
+        "Column 2 shows what the system expects if it does nothing. "
+        "Column 4 shows the expected state after the digital twin applies the selected control actions."
+    )
+
+
+    # ============================================================
+    # ROOM VISUALIZATION
+    # ============================================================
+
+    def make_room_figure(state, actions, status_color):
+        fig = go.Figure()
+
+        fig.add_shape(
+            type="rect",
+            x0=0,
+            y0=0,
+            x1=12,
+            y1=7,
+            line=dict(color="black", width=3),
+            fillcolor=status_color,
+            opacity=0.45,
         )
 
-    vent_color = "#2196F3" if actions["ventilation"] > 0 else "#9E9E9E"
-    fig.add_shape(
-        type="rect",
-        x0=11.45,
-        y0=3.3,
-        x1=12.4,
-        y1=5.6,
-        line=dict(color=vent_color, width=3),
-        fillcolor=vent_color,
-        opacity=0.85,
-    )
-    fig.add_annotation(x=12.7, y=4.45, text="Vent", showarrow=False, font=dict(size=12))
+        dots = min(int(state["occupancy"]), 220)
+        if dots > 0:
+            rng = np.random.default_rng(42)
+            x = rng.uniform(0.8, 11.2, dots)
+            y = rng.uniform(0.8, 6.2, dots)
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=7, color="black"),
+                    hovertemplate="Person<extra></extra>",
+                )
+            )
 
-    # Main door
-    fig.add_shape(
-        type="rect",
-        x0=5.2,
-        y0=-0.1,
-        x1=6.8,
-        y1=0.15,
-        line=dict(color="#795548", width=3),
-        fillcolor="#795548",
-    )
-    fig.add_annotation(x=6, y=-0.35, text="Main door", showarrow=False, font=dict(size=11))
+        vent_color = "#2196F3" if actions["ventilation"] > 0 else "#9E9E9E"
+        fig.add_shape(
+            type="rect",
+            x0=11.45,
+            y0=3.3,
+            x1=12.4,
+            y1=5.6,
+            line=dict(color=vent_color, width=3),
+            fillcolor=vent_color,
+            opacity=0.85,
+        )
+        fig.add_annotation(x=12.7, y=4.45, text="Vent", showarrow=False, font=dict(size=12))
 
-    # Emergency exit
-    fig.add_shape(
-        type="rect",
-        x0=-0.1,
-        y0=4.8,
-        x1=0.15,
-        y1=6.2,
-        line=dict(color="#D32F2F", width=3),
-        fillcolor="#D32F2F",
-    )
-    fig.add_annotation(
-        x=-0.45,
-        y=5.5,
-        text="Emergency exit",
-        textangle=-90,
-        showarrow=False,
-        font=dict(size=11, color="#D32F2F"),
-    )
+        # Main door
+        fig.add_shape(
+            type="rect",
+            x0=5.2,
+            y0=-0.1,
+            x1=6.8,
+            y1=0.15,
+            line=dict(color="#795548", width=3),
+            fillcolor="#795548",
+        )
+        fig.add_annotation(x=6, y=-0.35, text="Main door", showarrow=False, font=dict(size=11))
 
-    title = f"{state['situation']} | Ventilation {actions['ventilation']:.0f}% | Cooling {actions['cooling']:.0f}%"
-    fig.add_annotation(x=6, y=7.45, text=title, showarrow=False, font=dict(size=15))
+        # Emergency exit
+        fig.add_shape(
+            type="rect",
+            x0=-0.1,
+            y0=4.8,
+            x1=0.15,
+            y1=6.2,
+            line=dict(color="#D32F2F", width=3),
+            fillcolor="#D32F2F",
+        )
+        fig.add_annotation(
+            x=-0.45,
+            y=5.5,
+            text="Emergency exit",
+            textangle=-90,
+            showarrow=False,
+            font=dict(size=11, color="#D32F2F"),
+        )
 
-    fig.update_layout(
-        height=430,
-        xaxis=dict(visible=False, range=[-0.8, 13.4]),
-        yaxis=dict(visible=False, range=[-0.6, 7.8]),
-        margin=dict(l=10, r=10, t=50, b=10),
-        showlegend=False,
-    )
+        title = f"{state['situation']} | Ventilation {actions['ventilation']:.0f}% | Cooling {actions['cooling']:.0f}%"
+        fig.add_annotation(x=6, y=7.45, text=title, showarrow=False, font=dict(size=15))
 
-    return fig
+        fig.update_layout(
+            height=430,
+            xaxis=dict(visible=False, range=[-0.8, 13.4]),
+            yaxis=dict(visible=False, range=[-0.6, 7.8]),
+            margin=dict(l=10, r=10, t=50, b=10),
+            showlegend=False,
+        )
 
-
-left, right = st.columns([1.05, 1])
-
-with left:
-    st.subheader("Room state visualization")
-    fig_room = make_room_figure(state, actions, status_color)
-    st.plotly_chart(fig_room, width="stretch")
+        return fig
 
 
-with right:
-    st.subheader("3. Digital twin control decision")
+    left, right = st.columns([1.05, 1])
 
-    def pct_bar(label, value, caption=""):
-        st.write(f"**{label}: {value:.0f}%**")
-        st.progress(int(clamp(value, 0, 100)))
-        if caption:
-            st.caption(caption)
+    with left:
+        st.subheader("Room state visualization")
+        fig_room = make_room_figure(state, actions, status_color)
+        st.plotly_chart(fig_room, width="stretch", key="room_state_plot")
 
-    pct_bar("Ventilation", actions["ventilation"], "Removes CO₂ and stabilizes humidity.")
-    pct_bar("Outside air intake", actions["outside_air_intake"])
-    pct_bar("Air filtration", actions["filtration"], "Reduces PM10, VOC and formaldehyde.")
-    pct_bar("Heating", actions["heating"])
-    pct_bar("Cooling", actions["cooling"])
-    pct_bar("Lighting", actions["lighting"])
 
-    if actions["emergency_lights"] > 0:
-        pct_bar("Emergency lights", actions["emergency_lights"])
+    with right:
+        st.subheader("3. Digital twin control decision")
 
-    if actions["smoke_exhaust"] > 0:
-        pct_bar("Smoke exhaust", actions["smoke_exhaust"])
+        def pct_bar(label, value, caption=""):
+            st.write(f"**{label}: {value:.0f}%**")
+            st.progress(int(clamp(value, 0, 100)))
+            if caption:
+                st.caption(caption)
 
-    st.write(f"**Energy saving:** {'ON' if actions['energy_saving'] else 'OFF'}")
-    st.write(f"**Alarm:** {actions['alarm_state']}")
-    st.write(f"**Exits:** {actions['exits_state']}")
+        pct_bar("Ventilation", actions["ventilation"], "Removes CO₂ and stabilizes humidity.")
+        pct_bar("Outside air intake", actions["outside_air_intake"])
+        pct_bar("Air filtration", actions["filtration"], "Reduces PM10, VOC and formaldehyde.")
+        pct_bar("Heating", actions["heating"])
+        pct_bar("Cooling", actions["cooling"])
+        pct_bar("Lighting", actions["lighting"])
 
-    with st.expander("Why did the system choose these actions?"):
+        if actions["emergency_lights"] > 0:
+            pct_bar("Emergency lights", actions["emergency_lights"])
+
+        if actions["smoke_exhaust"] > 0:
+            pct_bar("Smoke exhaust", actions["smoke_exhaust"])
+
+        st.write(f"**Energy saving:** {'ON' if actions['energy_saving'] else 'OFF'}")
+        st.write(f"**Alarm:** {actions['alarm_state']}")
+        st.write(f"**Exits:** {actions['exits_state']}")
+
+        with st.expander("Why did the system choose these actions?"):
+            for note in actions["notes"]:
+                st.write(f"- {note}")
+
+        st.info(
+            "After this step, these actions are applied to the room model. "
+            "The changed room state becomes the next sensor input."
+        )
+
+
+    # ============================================================
+    # EXPLANATION
+    # ============================================================
+
+    with st.expander("Why did the system act?"):
         for note in actions["notes"]:
             st.write(f"- {note}")
 
-    st.info(
-        "After this step, these actions are applied to the room model. "
-        "The changed room state becomes the next sensor input."
-    )
+
+    # ============================================================
+    # HISTORY UPDATE AND CHARTS
+    # ============================================================
+
+    history_row = {
+        "step": step,
+        "situation": state["situation"],
+        "space_mode": state["space_mode"],
+        "occupancy": state["occupancy"],
+        "co2_ppm": state["co2_ppm"],
+        "temperature_c": state["indoor_temperature_c"],
+        "humidity_percent": state["relative_humidity_percent"],
+        "tvoc_ug_m3": state["tvoc_ug_m3"],
+        "battery_percent": state["battery_percent"],
+        "comfort_score": state["comfort_score"],
+        "ventilation": actions["ventilation"],
+        "filtration": actions["filtration"],
+        "heating": actions["heating"],
+        "cooling": actions["cooling"],
+        "lighting": actions["lighting"],
+        "forecast_co2_without_action": forecast_no_action["co2_ppm"],
+        "forecast_co2_after_action": forecast_after_action["co2_ppm"],
+        "forecast_temp_without_action": forecast_no_action["indoor_temperature_c"],
+        "forecast_temp_after_action": forecast_after_action["indoor_temperature_c"],
+    }
+
+    if not st.session_state.history or st.session_state.history[-1]["step"] != step:
+        st.session_state.history.append(history_row)
+
+    history = pd.DataFrame(st.session_state.history).tail(160)
+
+    st.subheader("Closed-loop simulation history")
+
+    tab_env, tab_actions = st.tabs(["Environment", "Actions"])
+
+    with tab_env:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=history["step"], y=history["co2_ppm"], mode="lines", name="Actual CO₂"))
+        fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
+        fig.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="CO₂, ppm")
+        st.plotly_chart(fig, width="stretch", key="co2_history_plot")
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=history["step"], y=history["temperature_c"], mode="lines", name="Actual temperature"))
+        fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
+        fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
+        fig2.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Temperature, °C")
+        st.plotly_chart(fig2, width="stretch", key="temperature_history_plot")
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=history["step"], y=history["comfort_score"], mode="lines", name="Comfort score"))
+        fig3.add_trace(go.Scatter(x=history["step"], y=history["battery_percent"], mode="lines", name="Battery"))
+        fig3.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Value")
+        st.plotly_chart(fig3, width="stretch", key="comfort_battery_history_plot")
+
+    with tab_actions:
+        fig = go.Figure()
+        for col, name in [
+            ("ventilation", "Ventilation"),
+            ("filtration", "Filtration"),
+            ("heating", "Heating"),
+            ("cooling", "Cooling"),
+            ("lighting", "Lighting"),
+        ]:
+            fig.add_trace(go.Scatter(x=history["step"], y=history[col], mode="lines", name=name))
+
+        fig.update_layout(height=380, xaxis_title="Simulation step", yaxis_title="Control level, %")
+        st.plotly_chart(fig, width="stretch", key="actions_history_plot")
 
 
-# ============================================================
-# EXPLANATION
-# ============================================================
-
-with st.expander("Why did the system act?"):
-    for note in actions["notes"]:
-        st.write(f"- {note}")
 
 
-# ============================================================
-# HISTORY UPDATE AND CHARTS
-# ============================================================
-
-history_row = {
-    "step": step,
-    "situation": state["situation"],
-    "space_mode": state["space_mode"],
-    "occupancy": state["occupancy"],
-    "co2_ppm": state["co2_ppm"],
-    "temperature_c": state["indoor_temperature_c"],
-    "humidity_percent": state["relative_humidity_percent"],
-    "tvoc_ug_m3": state["tvoc_ug_m3"],
-    "battery_percent": state["battery_percent"],
-    "comfort_score": state["comfort_score"],
-    "ventilation": actions["ventilation"],
-    "filtration": actions["filtration"],
-    "heating": actions["heating"],
-    "cooling": actions["cooling"],
-    "lighting": actions["lighting"],
-    "forecast_co2_without_action": forecast_no_action["co2_ppm"],
-    "forecast_co2_after_action": forecast_after_action["co2_ppm"],
-    "forecast_temp_without_action": forecast_no_action["indoor_temperature_c"],
-    "forecast_temp_after_action": forecast_after_action["indoor_temperature_c"],
-}
-
-if not st.session_state.history or st.session_state.history[-1]["step"] != step:
-    st.session_state.history.append(history_row)
-
-history = pd.DataFrame(st.session_state.history).tail(160)
-
-st.subheader("Closed-loop simulation history")
-
-tab_env, tab_actions = st.tabs(["Environment", "Actions"])
-
-with tab_env:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=history["step"], y=history["co2_ppm"], mode="lines", name="Actual CO₂"))
-    fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
-    fig.add_trace(go.Scatter(x=history["step"], y=history["forecast_co2_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
-    fig.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="CO₂, ppm")
-    st.plotly_chart(fig, width="stretch")
-
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=history["step"], y=history["temperature_c"], mode="lines", name="Actual temperature"))
-    fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_without_action"], mode="lines", name="Forecast without action", line=dict(dash="dash")))
-    fig2.add_trace(go.Scatter(x=history["step"], y=history["forecast_temp_after_action"], mode="lines", name="Forecast after action", line=dict(dash="dot")))
-    fig2.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Temperature, °C")
-    st.plotly_chart(fig2, width="stretch")
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=history["step"], y=history["comfort_score"], mode="lines", name="Comfort score"))
-    fig3.add_trace(go.Scatter(x=history["step"], y=history["battery_percent"], mode="lines", name="Battery"))
-    fig3.update_layout(height=330, xaxis_title="Simulation step", yaxis_title="Value")
-    st.plotly_chart(fig3, width="stretch")
-
-with tab_actions:
-    fig = go.Figure()
-    for col, name in [
-        ("ventilation", "Ventilation"),
-        ("filtration", "Filtration"),
-        ("heating", "Heating"),
-        ("cooling", "Cooling"),
-        ("lighting", "Lighting"),
-    ]:
-        fig.add_trace(go.Scatter(x=history["step"], y=history[col], mode="lines", name=name))
-
-    fig.update_layout(height=380, xaxis_title="Simulation step", yaxis_title="Control level, %")
-    st.plotly_chart(fig, width="stretch")
+    if auto_run:
+        st.session_state.state = next_state
 
 
-# ============================================================
-# APPLY NEXT STATE
-# ============================================================
-
-should_advance = auto_run or st.session_state.pop("manual_next", False)
-
-if should_advance:
-    st.session_state.state = next_state
-    time.sleep(speed)
-    st.rerun()
+render_simulation_frame()
