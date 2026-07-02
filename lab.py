@@ -688,31 +688,96 @@ next_state["step"] = step + 1
 
 st.title("Adaptive Student Coworking Digital Twin")
 
-metric_cols = st.columns(8)
+mode_label = "Shelter" if state["space_mode"] == "shelter" else "Coworking"
 
-with metric_cols[0]:
-    st.metric("Current situation", state["situation"])
+st.markdown(
+    f"""
+    <div style="
+        padding: 1rem 1.2rem;
+        border-radius: 0.8rem;
+        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.04);
+        margin-bottom: 1rem;">
+        <div style="font-size: 0.9rem; opacity: 0.75;">Current simulation step</div>
+        <div style="font-size: 1.6rem; font-weight: 800;">{state['situation']}</div>
+        <div style="font-size: 1rem; opacity: 0.85;">
+            Space mode: <b>{mode_label}</b> · Step: <b>{step}</b> · 
+            The loop is: sensors → forecast → control action → changed room state → next sensor state.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-with metric_cols[1]:
+# ============================================================
+# STEP 1 — CURRENT SENSOR INPUT
+# ============================================================
+
+st.subheader("1. Sensor input: current measured room state")
+
+sensor_cols = st.columns(6)
+
+with sensor_cols[0]:
     st.metric("People", int(state["occupancy"]))
 
-with metric_cols[2]:
+with sensor_cols[1]:
     st.metric("Capacity use", f"{state['occupancy'] / max(state['active_capacity'], 1) * 100:.0f}%")
 
-with metric_cols[3]:
+with sensor_cols[2]:
     st.metric("CO₂", f"{state['co2_ppm']:.0f} ppm")
 
-with metric_cols[4]:
+with sensor_cols[3]:
     st.metric("Temperature", f"{state['indoor_temperature_c']:.1f} °C")
 
-with metric_cols[5]:
+with sensor_cols[4]:
     st.metric("Humidity", f"{state['relative_humidity_percent']:.0f}%")
 
-with metric_cols[6]:
-    st.metric("Battery", f"{state['battery_percent']:.0f}%")
-
-with metric_cols[7]:
+with sensor_cols[5]:
     st.metric("Comfort", f"{state['comfort_score']:.0f}/100")
+
+
+# ============================================================
+# STEPS 2–4 — CLOSED LOOP TABLE
+# ============================================================
+
+st.subheader("2–4. Forecast, decision and simulated result")
+
+closed_loop_table = pd.DataFrame(
+    {
+        "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
+        "1. Current sensor state": [
+            f"{state['co2_ppm']:.0f} ppm",
+            f"{state['indoor_temperature_c']:.1f} °C",
+            f"{state['relative_humidity_percent']:.0f}%",
+            f"{state['tvoc_ug_m3']:.0f} μg/m³",
+            f"{state['battery_percent']:.0f}%",
+            f"{state['comfort_score']:.0f}/100",
+        ],
+        "2. Predicted in 10 min without action": [
+            f"{forecast_no_action['co2_ppm']:.0f} ppm",
+            f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
+            f"{forecast_no_action['relative_humidity_percent']:.0f}%",
+            f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
+            f"{forecast_no_action['battery_percent']:.0f}%",
+            f"{forecast_no_action['comfort_score']:.0f}/100",
+        ],
+        "4. Predicted in 10 min after action": [
+            f"{forecast_after_action['co2_ppm']:.0f} ppm",
+            f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
+            f"{forecast_after_action['relative_humidity_percent']:.0f}%",
+            f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
+            f"{forecast_after_action['battery_percent']:.0f}%",
+            f"{forecast_after_action['comfort_score']:.0f}/100",
+        ],
+    }
+)
+
+st.dataframe(closed_loop_table, width="stretch", hide_index=True)
+
+st.caption(
+    "Column 2 shows what the system expects if it does nothing. "
+    "Column 4 shows the expected state after the digital twin applies the selected control actions."
+)
 
 
 # ============================================================
@@ -796,7 +861,7 @@ def make_room_figure(state, actions, status_color):
     fig.add_annotation(x=6, y=7.45, text=title, showarrow=False, font=dict(size=15))
 
     fig.update_layout(
-        height=460,
+        height=430,
         xaxis=dict(visible=False, range=[-0.8, 13.4]),
         yaxis=dict(visible=False, range=[-0.6, 7.8]),
         margin=dict(l=10, r=10, t=50, b=10),
@@ -806,57 +871,16 @@ def make_room_figure(state, actions, status_color):
     return fig
 
 
-left, middle, right = st.columns([1.1, 0.9, 1])
+left, right = st.columns([1.05, 1])
 
 with left:
-    st.subheader("Room state")
+    st.subheader("Room state visualization")
     fig_room = make_room_figure(state, actions, status_color)
     st.plotly_chart(fig_room, width="stretch")
 
 
-with middle:
-    st.subheader("Feedback loop forecast")
-
-    forecast_table = pd.DataFrame(
-        {
-            "Indicator": ["CO₂", "Temperature", "Humidity", "TVOC", "Battery", "Comfort"],
-            "Current state": [
-                f"{state['co2_ppm']:.0f} ppm",
-                f"{state['indoor_temperature_c']:.1f} °C",
-                f"{state['relative_humidity_percent']:.0f}%",
-                f"{state['tvoc_ug_m3']:.0f} μg/m³",
-                f"{state['battery_percent']:.0f}%",
-                f"{state['comfort_score']:.0f}/100",
-            ],
-            "In 10 min without action": [
-                f"{forecast_no_action['co2_ppm']:.0f} ppm",
-                f"{forecast_no_action['indoor_temperature_c']:.1f} °C",
-                f"{forecast_no_action['relative_humidity_percent']:.0f}%",
-                f"{forecast_no_action['tvoc_ug_m3']:.0f} μg/m³",
-                f"{forecast_no_action['battery_percent']:.0f}%",
-                f"{forecast_no_action['comfort_score']:.0f}/100",
-            ],
-            "In 10 min after action": [
-                f"{forecast_after_action['co2_ppm']:.0f} ppm",
-                f"{forecast_after_action['indoor_temperature_c']:.1f} °C",
-                f"{forecast_after_action['relative_humidity_percent']:.0f}%",
-                f"{forecast_after_action['tvoc_ug_m3']:.0f} μg/m³",
-                f"{forecast_after_action['battery_percent']:.0f}%",
-                f"{forecast_after_action['comfort_score']:.0f}/100",
-            ],
-        }
-    )
-
-    st.dataframe(forecast_table, width="stretch", hide_index=True)
-
-    st.caption(
-        "The system predicts what would happen without intervention, chooses control actions, "
-        "and then simulates the changed room state after those actions are applied."
-    )
-
-
 with right:
-    st.subheader("Automatic control actions")
+    st.subheader("3. Digital twin control decision")
 
     def pct_bar(label, value, caption=""):
         st.write(f"**{label}: {value:.0f}%**")
@@ -864,9 +888,9 @@ with right:
         if caption:
             st.caption(caption)
 
-    pct_bar("Ventilation", actions["ventilation"], "Controls CO₂ and humidity.")
+    pct_bar("Ventilation", actions["ventilation"], "Removes CO₂ and stabilizes humidity.")
     pct_bar("Outside air intake", actions["outside_air_intake"])
-    pct_bar("Air filtration", actions["filtration"], "Controls PM10, VOC and formaldehyde.")
+    pct_bar("Air filtration", actions["filtration"], "Reduces PM10, VOC and formaldehyde.")
     pct_bar("Heating", actions["heating"])
     pct_bar("Cooling", actions["cooling"])
     pct_bar("Lighting", actions["lighting"])
@@ -880,6 +904,15 @@ with right:
     st.write(f"**Energy saving:** {'ON' if actions['energy_saving'] else 'OFF'}")
     st.write(f"**Alarm:** {actions['alarm_state']}")
     st.write(f"**Exits:** {actions['exits_state']}")
+
+    with st.expander("Why did the system choose these actions?"):
+        for note in actions["notes"]:
+            st.write(f"- {note}")
+
+    st.info(
+        "After this step, these actions are applied to the room model. "
+        "The changed room state becomes the next sensor input."
+    )
 
 
 # ============================================================
